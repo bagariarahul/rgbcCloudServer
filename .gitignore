@@ -1,0 +1,16 @@
+# Node modules
+node_modules/
+
+# Logs
+logs
+*.log
+npm-debug.log*
+
+# Environment files
+.env
+
+# Database (optional)
+cloudbackup.db
+
+# Uploads (optional)
+uploads/
