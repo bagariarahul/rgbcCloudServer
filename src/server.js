@@ -441,6 +441,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
 });
 
 // Simple download (your Android app uses this)
+// Fixed download endpoint - serves specific files
 app.get('/download', async (req, res) => {
     try {
         const { file, user } = req.query;
@@ -455,32 +456,65 @@ app.get('/download', async (req, res) => {
         console.log(`📥 Download requested: ${file} by ${user || 'anonymous'}`);
         
         const uploadsDir = process.env.UPLOAD_PATH || './uploads';
+        
+        // 🔧 FIX: Look for specific file, not just latest
         const uploadedFiles = await fs.readdir(uploadsDir);
         
-        if (uploadedFiles.length === 0) {
-            return res.status(404).json({
-                error: 'No files found',
-                message: 'No uploaded files available for download'
-            });
+        // Try to find exact match first
+        let targetFile = uploadedFiles.find(f => f === file);
+        
+        // If no exact match, try partial match (for legacy compatibility)
+        if (!targetFile) {
+            targetFile = uploadedFiles.find(f => f.includes(file.replace('.dat', '')));
         }
         
-        // Get the most recent file
-        const fileStats = await Promise.all(
-            uploadedFiles.map(async filename => ({
-                name: filename,
-                path: `${uploadsDir}/${filename}`,
-                time: (await fs.stat(`${uploadsDir}/${filename}`)).mtime.getTime()
-            }))
-        );
-        
-        const latestFile = fileStats.sort((a, b) => b.time - a.time)[0];
+        // 🚨 CRITICAL FIX: Don't just use latest file!
+        if (!targetFile) {
+            // Only fallback to latest if specifically requested
+            if (file === 'encrypted_backup.dat' || file === 'latest') {
+                const fileStats = await Promise.all(
+                    uploadedFiles.map(async filename => ({
+                        name: filename,
+                        path: `${uploadsDir}/${filename}`,
+                        time: (await fs.stat(`${uploadsDir}/${filename}`)).mtime.getTime()
+                    }))
+                );
+                
+                if (fileStats.length === 0) {
+                    return res.status(404).json({
+                        error: 'No files found',
+                        message: 'No uploaded files available'
+                    });
+                }
+                
+                targetFile = fileStats.sort((a, b) => b.time - a.time)[0].name;
+                console.log(`📂 Serving latest file: ${targetFile}`);
+            } else {
+                return res.status(404).json({
+                    error: 'File not found',
+                    message: `File '${file}' not found on server`
+                });
+            }
+        } else {
+            console.log(`📂 Serving specific file: ${targetFile}`);
+        }
 
-        console.log(`📂 Serving file: ${latestFile.name}`);
+        const filePath = `${uploadsDir}/${targetFile}`;
+        
+        // Verify file exists
+        try {
+            await fs.access(filePath);
+        } catch (error) {
+            return res.status(404).json({
+                error: 'File not accessible',
+                message: 'File exists but cannot be accessed'
+            });
+        }
         
         res.setHeader('Content-Disposition', `attachment; filename="${file}"`);
         res.setHeader('Content-Type', 'application/octet-stream');
         
-        const fileStream = require('fs').createReadStream(latestFile.path);
+        const fileStream = require('fs').createReadStream(filePath);
         fileStream.pipe(res);
 
     } catch (error) {
@@ -491,6 +525,7 @@ app.get('/download', async (req, res) => {
         });
     }
 });
+
 
 // =============================================================================
 // 🚨 ERROR HANDLING
