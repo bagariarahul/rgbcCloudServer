@@ -59,18 +59,25 @@ function convertPlaceholders(query, params = []) {
   return { text, values: params };
 }
 
-if (DATABASE_URL && DATABASE_URL.startsWith('postgresql://')) {
+const connStr = process.env.DATABASE_PUBLIC_URL || process.env.DATABASE_URL || '';
+
+
+if (connStr && connStr.startsWith('postgresql://')) {
   isPostgres = true;
   const { Pool } = require('pg');
   pool = new Pool({
-    connectionString: DATABASE_URL,
-    ssl: NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+    connectionString: connStr,
+    ssl: { rejectUnauthorized: false }
   });
 
-  pool.on('error', (err) => {
-    console.error('Postgres pool error', err);
-    // don't exit here; let operations fail and be logged
-  });
+ pool.connect()
+    .then(client => {
+      client.release();
+      console.log('✅ Postgres connection established (using connectionString from env).');
+    })
+    .catch(err => {
+      console.error('❌ Postgres connection test failed:', err.message || err);
+    });
 
   dbRun = async (query, params = []) => {
     const { text, values } = convertPlaceholders(query, params);
