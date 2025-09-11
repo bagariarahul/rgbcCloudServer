@@ -46,7 +46,7 @@ logger.info('🚀 Starting Cloud Backup Server...');
 // =============================================================================
 const PORT = process.env.PORT || 3000;
 const NODE_ENV = process.env.NODE_ENV || 'development';
-const DATABASE_URL = process.env.DATABASE_PUBLIC_URL || process.env.DATABASE_URL; // Use PUBLIC_URL for Railway
+const DATABASE_URL = process.env.DATABASE_URL; // Railway automatically provides this
 const SESSION_SECRET = process.env.SESSION_SECRET || 'dev-session-secret-change-in-production';
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-jwt-secret-change-in-production';
 const UPLOADS_DIR = process.env.UPLOAD_PATH || './uploads';
@@ -71,18 +71,18 @@ if (DATABASE_URL && DATABASE_URL.startsWith('postgresql://')) {
     
     // Railway-specific SSL configuration
     const isRailway = DATABASE_URL.includes('railway.app') || DATABASE_URL.includes('rlwy.net');
+    const isProduction = NODE_ENV === 'production';
     
     let poolConfig = {
         connectionString: DATABASE_URL,
-        max: 10, // Reduced for Railway limits
-        idleTimeoutMillis: 20000,
-        connectionTimeoutMillis: 15000,
-        acquireTimeoutMillis: 15000,
+        max: 5, // Reduced further for Railway limits
+        idleTimeoutMillis: 30000,
+        connectionTimeoutMillis: 20000,
         allowExitOnIdle: true
     };
 
-    // SSL configuration for Railway
-    if (isRailway || NODE_ENV === 'production') {
+    // Only force SSL in production on Railway
+    if (isProduction && isRailway) {
         poolConfig.ssl = {
             rejectUnauthorized: false
         };
@@ -347,7 +347,7 @@ app.use(session({
     saveUninitialized: false,
     name: 'cloudbackup.sid',
     cookie: {
-        secure: false, // Allow HTTP for now
+        secure: NODE_ENV === 'production', // Use secure cookies in production
         httpOnly: true,
         maxAge: 24 * 60 * 60 * 1000, // 24 hours
         sameSite: 'lax'
@@ -362,7 +362,9 @@ if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
     passport.use(new GoogleStrategy({
         clientID: process.env.GOOGLE_CLIENT_ID,
         clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-        callbackURL: process.env.GOOGLE_CALLBACK_URL || '/auth/google/callback'
+        callbackURL: process.env.GOOGLE_CALLBACK_URL || (NODE_ENV === 'production' ? 
+            `${process.env.RAILWAY_PUBLIC_DOMAIN || process.env.BASE_URL}/auth/google/callback` : 
+            '/auth/google/callback')
     }, async (accessToken, refreshToken, profile, done) => {
         try {
             const email = profile.emails?.[0]?.value;
@@ -474,27 +476,41 @@ const asyncHandler = (fn) => (req, res, next) => {
 // 🌐 API ROUTES
 // =============================================================================
 
-// Health check
-app.get('/health', (req, res) => {
-    res.status(200).json({ 
-        status: 'healthy', 
-        timestamp: new Date().toISOString(),
-        environment: NODE_ENV,
-        uptime: Math.floor(process.uptime())
-    });
-});
+// Health check with database connectivity test
+app.get('/health', asyncHandler(async (req, res) => {
+    try {
+        // Test database connection
+        await dbGet('SELECT 1 as test');
+        res.status(200).json({ 
+            status: 'healthy', 
+            timestamp: new Date().toISOString(),
+            environment: NODE_ENV,
+            uptime: Math.floor(process.uptime()),
+            database: 'connected'
+        });
+    } catch (error) {
+        logger.error('❌ Health check failed - database connection error', { error: error.message });
+        res.status(500).json({ 
+            status: 'unhealthy', 
+            error: 'Database connection failed',
+            timestamp: new Date().toISOString(),
+            database: 'disconnected'
+        });
+    }
+}));
 
 // Root endpoint
 app.get('/', (req, res) => {
     res.json({
         message: 'Cloud Backup Server is running!',
         version: '1.0.0',
+        environment: NODE_ENV,
         endpoints: {
             health: '/health',
             auth: {
                 register: 'POST /api/register',
                 login: 'POST /api/login',
-                googleOAuth: '/auth/google'
+                googleOAuth: process.env.GOOGLE_CLIENT_ID ? '/auth/google' : 'Not configured'
             },
             files: {
                 upload: 'POST /api/upload',
@@ -519,23 +535,33 @@ if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
             
             const token = jwt.sign({ userId: req.user.id }, JWT_SECRET, { expiresIn: '7d' });
             
-            res.status(200).json({ 
-                success: true, 
-                token, 
-                user: {
-                    id: req.user.id,
-                    email: req.user.email,
-                    firstName: req.user.first_name,
-                    lastName: req.user.last_name
-                },
-                message: 'Google OAuth login successful'
-            });
+            // Redirect to frontend with token
+            if (process.env.FRONTEND_URL) {
+                res.redirect(`${process.env.FRONTEND_URL}/auth/success?token=${token}`);
+            } else {
+                res.status(200).json({ 
+                    success: true, 
+                    token, 
+                    user: {
+                        id: req.user.id,
+                        email: req.user.email,
+                        firstName: req.user.first_name,
+                        lastName: req.user.last_name
+                    },
+                    message: 'Google OAuth login successful'
+                });
+            }
         })
     );
 
     app.get('/auth/google/error', (req, res) => {
         logger.warn('⚠️ Google OAuth authentication failed');
-        res.status(401).json({ success: false, error: 'Google OAuth authentication failed' });
+        
+        if (process.env.FRONTEND_URL) {
+            res.redirect(`${process.env.FRONTEND_URL}/auth/error`);
+        } else {
+            res.status(401).json({ success: false, error: 'Google OAuth authentication failed' });
+        }
     });
 }
 
@@ -734,12 +760,15 @@ const startServer = async () => {
                 port: PORT,
                 environment: NODE_ENV,
                 urls: {
-                    health: `http://localhost:${PORT}/health`,
-                    root: `http://localhost:${PORT}/`,
-                    oauth: process.env.GOOGLE_CLIENT_ID ? `http://localhost:${PORT}/auth/google` : 'Not configured'
+                    health: `/health`,
+                    root: `/`
                 }
             });
         });
+
+        // Add keep-alive handling for Railway
+        server.keepAliveTimeout = 65000;
+        server.headersTimeout = 66000;
 
         server.on('error', (err) => {
             logger.error('❌ Server error', { error: err.message, code: err.code });
@@ -788,7 +817,7 @@ process.on('unhandledRejection', (reason, promise) => {
     logger.error('💥 Unhandled Promise Rejection', { 
         reason: reason?.stack || reason
     });
-    gracefulShutdown('unhandledRejection');
+    // Don't call gracefulShutdown here as it might cause infinite loops
 });
 
 process.on('uncaughtException', (err) => {
