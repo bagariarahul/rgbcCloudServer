@@ -1,588 +1,247 @@
-const express = require('express');
-const cors = require('cors');
-const helmet = require('helmet');
-const morgan = require('morgan');
-const compression = require('compression');
-const rateLimit = require('express-rate-limit');
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
-const multer = require('multer');
-const path = require('path');
-const fs = require('fs').promises;
-const { v4: uuidv4 } = require('uuid');
-const Joi = require('joi');
-const sqlite3 = require('sqlite3').verbose();
 require('dotenv').config();
+const express = require('express');
+const session = require('express-session');
+const bodyParser = require('body-parser');
+const multer = require('multer');
+const cors = require('cors');
+const { v4: uuidv4 } = require('uuid');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
+
+// --------- CONFIG ---------
 const PORT = process.env.PORT || 3000;
+const NODE_ENV = process.env.NODE_ENV || 'development';
+const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret';
+const SESSION_SECRET = process.env.SESSION_SECRET || 'dev_session_secret';
+const UPLOAD_PATH = process.env.UPLOAD_PATH || './uploads';
+const BCRYPT_ROUNDS = parseInt(process.env.BCRYPT_ROUNDS || '12', 10);
 
-// =============================================================================
-// 🗄️ SQLITE DATABASE CONNECTION
-// =============================================================================
-
-const dbPath = './cloudbackup.db';
-const db = new sqlite3.Database(dbPath, (err) => {
-    if (err) {
-        console.error('❌ Database connection failed:', err.message);
-        process.exit(1);
-    } else {
-        console.log('✅ SQLite Database connected successfully');
-        initializeTables();
-    }
-});
-
-function initializeTables() {
-    // Users table
-    db.run(`CREATE TABLE IF NOT EXISTS users (
-        id TEXT PRIMARY KEY,
-        email TEXT UNIQUE NOT NULL,
-        password_hash TEXT NOT NULL,
-        first_name TEXT NOT NULL,
-        last_name TEXT NOT NULL,
-        storage_quota INTEGER DEFAULT 107374182400,
-        storage_used INTEGER DEFAULT 0,
-        is_active INTEGER DEFAULT 1,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`);
-
-    // Sessions table
-    db.run(`CREATE TABLE IF NOT EXISTS user_sessions (
-        id TEXT PRIMARY KEY,
-        user_id TEXT NOT NULL,
-        device_id TEXT NOT NULL,
-        device_name TEXT,
-        device_type TEXT,
-        access_token_hash TEXT NOT NULL,
-        refresh_token_hash TEXT NOT NULL,
-        expires_at DATETIME NOT NULL,
-        last_activity DATETIME DEFAULT CURRENT_TIMESTAMP,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (user_id) REFERENCES users (id)
-    )`);
-
-    // Files table
-    db.run(`CREATE TABLE IF NOT EXISTS user_files (
-        id TEXT PRIMARY KEY,
-        user_id TEXT NOT NULL,
-        filename TEXT NOT NULL,
-        original_path TEXT NOT NULL,
-        file_type TEXT,
-        mime_type TEXT,
-        file_size INTEGER NOT NULL,
-        storage_path TEXT NOT NULL,
-        checksum TEXT NOT NULL,
-        encryption_key TEXT NOT NULL,
-        encryption_algorithm TEXT DEFAULT 'AES-256-GCM',
-        is_encrypted INTEGER DEFAULT 1,
-        backup_status TEXT DEFAULT 'COMPLETED',
-        uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (user_id) REFERENCES users (id)
-    )`);
-    
-    console.log('✅ Database tables initialized');
+// ensure upload dir exists
+const uploadsDir = path.resolve(UPLOAD_PATH);
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir, { recursive: true });
 }
 
-// Helper functions to promisify SQLite
-function dbGet(sql, params = []) {
-    return new Promise((resolve, reject) => {
-        db.get(sql, params, (err, row) => {
-            if (err) reject(err);
-            else resolve(row);
-        });
-    });
-}
+// --------- MIDDLEWARE ---------
+app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: true }));
 
-function dbAll(sql, params = []) {
-    return new Promise((resolve, reject) => {
-        db.all(sql, params, (err, rows) => {
-            if (err) reject(err);
-            else resolve(rows);
-        });
-    });
-}
+// allow frontend origins
+const allowedOrigins = [
+  'http://localhost:3000',
+  'http://127.0.0.1:3000'
+];
+if (process.env.FRONTEND_URL) allowedOrigins.push(process.env.FRONTEND_URL);
 
-function dbRun(sql, params = []) {
-    return new Promise((resolve, reject) => {
-        db.run(sql, params, function(err) {
-            if (err) reject(err);
-            else resolve({ lastID: this.lastID, changes: this.changes });
-        });
-    });
-}
-
-// =============================================================================
-// 🔧 MIDDLEWARE SETUP
-// =============================================================================
-
-app.use(helmet());
 app.use(cors({
-    origin: ['http://localhost:3000', 'http://10.0.2.2:3000'],
-    methods: ['GET', 'POST', 'PUT', 'DELETE'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Device-ID'],
-    credentials: true
+  origin: allowedOrigins,
+  credentials: true
 }));
-app.use(compression());
-app.use(morgan('combined'));
 
-const limiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 100,
-    message: 'Too many requests, please try again later'
-});
-app.use(limiter);
+app.use(session({
+  secret: SESSION_SECRET,
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    secure: NODE_ENV === 'production',
+    httpOnly: true,
+    sameSite: NODE_ENV === 'production' ? 'none' : 'lax'
+  }
+}));
 
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+// --------- AUTH HELPERS ---------
+function generateToken(user) {
+  return jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN || '7d' });
+}
 
-// File upload configuration
+function authMiddleware(req, res, next) {
+  const header = req.headers['authorization'];
+  if (!header) return res.status(401).json({ error: 'Missing token' });
+  const token = header.split(' ')[1];
+  jwt.verify(token, JWT_SECRET, (err, decoded) => {
+    if (err) return res.status(403).json({ error: 'Invalid token' });
+    req.user = decoded;
+    next();
+  });
+}
+
+// --------- DATABASE SETUP ---------
+const DATABASE_URL = process.env.DATABASE_URL;
+let isPostgres = false;
+let pool = null;
+let dbRun, dbGet, dbAll, db;
+
+function convertPlaceholders(query, params = []) {
+  if (!isPostgres) return { text: query, values: params };
+  let idx = 0;
+  const text = query.replace(/\?/g, () => {
+    idx++;
+    return `$${idx}`;
+  });
+  return { text, values: params };
+}
+
+if (DATABASE_URL && DATABASE_URL.startsWith('postgresql://')) {
+  isPostgres = true;
+  const { Pool } = require('pg');
+  pool = new Pool({
+    connectionString: DATABASE_URL,
+    ssl: NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+  });
+
+  dbRun = async (query, params = []) => {
+    const { text, values } = convertPlaceholders(query, params);
+    const client = await pool.connect();
+    try {
+      return await client.query(text, values);
+    } finally {
+      client.release();
+    }
+  };
+
+  dbGet = async (query, params = []) => {
+    const { text, values } = convertPlaceholders(query, params);
+    const client = await pool.connect();
+    try {
+      const result = await client.query(text, values);
+      return result.rows[0];
+    } finally {
+      client.release();
+    }
+  };
+
+  dbAll = async (query, params = []) => {
+    const { text, values } = convertPlaceholders(query, params);
+    const client = await pool.connect();
+    try {
+      const result = await client.query(text, values);
+      return result.rows;
+    } finally {
+      client.release();
+    }
+  };
+} else {
+  const Database = require('sqlite3').Database;
+  const dbPath = './cloudbackup.db';
+  db = new Database(dbPath);
+
+  dbRun = (query, params = []) => new Promise((resolve, reject) => {
+    db.run(query, params, function(err) {
+      if (err) reject(err);
+      else resolve({ changes: this.changes, lastID: this.lastID });
+    });
+  });
+
+  dbGet = (query, params = []) => new Promise((resolve, reject) => {
+    db.get(query, params, (err, row) => {
+      if (err) reject(err);
+      else resolve(row);
+    });
+  });
+
+  dbAll = (query, params = []) => new Promise((resolve, reject) => {
+    db.all(query, params, (err, rows) => {
+      if (err) reject(err);
+      else resolve(rows);
+    });
+  });
+}
+
+// --------- MULTER ---------
 const storage = multer.diskStorage({
-    destination: async (req, file, cb) => {
-        const uploadPath = process.env.UPLOAD_PATH || './uploads';
-        await fs.mkdir(uploadPath, { recursive: true });
-        cb(null, uploadPath);
-    },
-    filename: (req, file, cb) => {
-        const uniqueName = `${uuidv4()}-${Date.now()}${path.extname(file.originalname)}`;
-        cb(null, uniqueName);
+  destination: (req, file, cb) => cb(null, uploadsDir),
+  filename: (req, file, cb) => cb(null, `${uuidv4()}_${file.originalname}`)
+});
+const upload = multer({ storage });
+
+// --------- ROUTES ---------
+
+// register
+app.post('/api/register', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const hash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+    const id = uuidv4();
+    await dbRun('INSERT INTO users (id, email, password) VALUES (?, ?, ?)', [id, email, hash]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Register error', err);
+    res.status(500).json({ error: 'Registration failed' });
+  }
+});
+
+// login
+app.post('/api/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const user = await dbGet('SELECT * FROM users WHERE email = ?', [email]);
+    if (!user) return res.status(400).json({ error: 'Invalid credentials' });
+    const match = await bcrypt.compare(password, user.password);
+    if (!match) return res.status(400).json({ error: 'Invalid credentials' });
+    const token = generateToken(user);
+    res.json({ token });
+  } catch (err) {
+    console.error('Login error', err);
+    res.status(500).json({ error: 'Login failed' });
+  }
+});
+
+// upload file
+app.post('/api/upload', authMiddleware, upload.single('file'), async (req, res) => {
+  try {
+    const { originalname, filename, mimetype, size, path: filePath } = req.file;
+    const fileId = uuidv4();
+    await dbRun(
+      `INSERT INTO files (id, user_id, filename, original_name, file_path, file_size, mime_type)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [fileId, req.user.id, filename, originalname, filePath, size, mimetype]
+    );
+    res.json({ success: true, fileId });
+  } catch (err) {
+    console.error('Upload error', err);
+    res.status(500).json({ error: 'Upload failed' });
+  }
+});
+
+// list files
+app.get('/api/files', authMiddleware, async (req, res) => {
+  try {
+    const files = await dbAll('SELECT * FROM files WHERE user_id = ?', [req.user.id]);
+    res.json({ files });
+  } catch (err) {
+    console.error('List files error', err);
+    res.status(500).json({ error: 'Could not list files' });
+  }
+});
+
+// download file
+app.get('/api/files/:id/download', authMiddleware, async (req, res) => {
+  try {
+    const fileId = req.params.id;
+    const fileRow = await dbGet('SELECT * FROM files WHERE id = ?', [fileId]);
+    if (!fileRow) return res.status(404).json({ error: 'File not found' });
+    if (fileRow.user_id !== req.user.id) return res.status(403).json({ error: 'Access denied' });
+
+    const absPath = path.resolve(fileRow.file_path);
+    if (!absPath.startsWith(uploadsDir)) {
+      return res.status(400).json({ error: 'Invalid file path' });
     }
+    if (!fs.existsSync(absPath)) return res.status(404).json({ error: 'File not found on disk' });
+
+    res.setHeader('Content-Type', fileRow.mime_type || 'application/octet-stream');
+    res.setHeader('Content-Disposition', `attachment; filename="${fileRow.original_name || fileRow.filename}"`);
+    fs.createReadStream(absPath).pipe(res);
+  } catch (err) {
+    console.error('Download error', err);
+    res.status(500).json({ error: 'Download failed' });
+  }
 });
 
-const upload = multer({
-    storage,
-    limits: { fileSize: 100 * 1024 * 1024 }, // 100MB
-    fileFilter: (req, file, cb) => {
-        cb(null, true);
-    }
-});
-
-// =============================================================================
-// 🔐 AUTHENTICATION MIDDLEWARE
-// =============================================================================
-
-const authMiddleware = async (req, res, next) => {
-    try {
-        const authHeader = req.headers.authorization;
-        
-        if (!authHeader || !authHeader.startsWith('Bearer ')) {
-            return res.status(401).json({
-                error: 'Authentication required',
-                message: 'Missing or invalid authorization header'
-            });
-        }
-
-        const token = authHeader.substring(7);
-        const decoded = jwt.verify(token, process.env.JWT_SECRET || 'fallback_secret');
-        
-        // Verify session exists and is valid
-        const session = await dbGet(`
-            SELECT s.*, u.id as user_id, u.email, u.first_name, u.last_name, u.is_active
-            FROM user_sessions s
-            JOIN users u ON s.user_id = u.id
-            WHERE s.id = ? AND datetime(s.expires_at) > datetime('now') AND u.is_active = 1
-        `, [decoded.sessionId]);
-        
-        if (!session) {
-            return res.status(401).json({
-                error: 'Invalid session',
-                message: 'Session expired or not found'
-            });
-        }
-
-        req.user = {
-            id: session.user_id,
-            email: session.email,
-            firstName: session.first_name,
-            lastName: session.last_name,
-            sessionId: session.id
-        };
-
-        // Update last activity
-        await dbRun(
-            'UPDATE user_sessions SET last_activity = datetime("now") WHERE id = ?',
-            [decoded.sessionId]
-        );
-
-        next();
-    } catch (error) {
-        console.error('Auth middleware error:', error);
-        return res.status(401).json({
-            error: 'Invalid token',
-            message: 'Token verification failed'
-        });
-    }
-};
-
-// =============================================================================
-// 🏥 HEALTH CHECK
-// =============================================================================
-
-app.get('/health', async (req, res) => {
-    try {
-        const userCount = await dbGet('SELECT COUNT(*) as count FROM users');
-        
-        res.json({
-            status: 'healthy',
-            timestamp: new Date().toISOString(),
-            uptime: process.uptime(),
-            version: '2.0.0',
-            environment: process.env.NODE_ENV || 'development',
-            database: {
-                status: 'connected',
-                users: userCount.count
-            }
-        });
-    } catch (error) {
-        res.status(503).json({
-            status: 'unhealthy',
-            error: error.message,
-            timestamp: new Date().toISOString()
-        });
-    }
-});
-
-// =============================================================================
-// 🔐 AUTHENTICATION ENDPOINTS
-// =============================================================================
-
-// User Registration
-app.post('/api/auth/register', async (req, res) => {
-    try {
-        const { email, password, firstName, lastName, deviceName, deviceType, deviceId } = req.body;
-
-        // Basic validation
-        if (!email || !password || !firstName || !lastName || !deviceId) {
-            return res.status(400).json({
-                error: 'Validation failed',
-                message: 'Missing required fields'
-            });
-        }
-
-        // Check if user already exists
-        const existingUser = await dbGet('SELECT id FROM users WHERE email = ?', [email]);
-        if (existingUser) {
-            return res.status(409).json({
-                error: 'Email already registered',
-                message: 'An account with this email already exists'
-            });
-        }
-
-        // Create user
-        const userId = uuidv4();
-        const passwordHash = await bcrypt.hash(password, 12);
-        
-        await dbRun(`
-            INSERT INTO users (id, email, password_hash, first_name, last_name)
-            VALUES (?, ?, ?, ?, ?)
-        `, [userId, email, passwordHash, firstName, lastName]);
-
-        // Create session
-        const sessionId = uuidv4();
-        const tokenPayload = { userId, sessionId, email };
-        const accessToken = jwt.sign(tokenPayload, process.env.JWT_SECRET || 'fallback_secret', {
-            expiresIn: '7d'
-        });
-        const refreshToken = jwt.sign({ ...tokenPayload, type: 'refresh' }, process.env.JWT_SECRET || 'fallback_secret', {
-            expiresIn: '30d'
-        });
-
-        const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
-
-        await dbRun(`
-            INSERT INTO user_sessions (id, user_id, device_id, device_name, device_type, 
-                                     access_token_hash, refresh_token_hash, expires_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        `, [sessionId, userId, deviceId, deviceName || 'Unknown Device', deviceType || 'ANDROID',
-            await bcrypt.hash(accessToken, 5), await bcrypt.hash(refreshToken, 5), expiresAt]);
-
-        console.log(`✅ User registered: ${email}`);
-
-        res.status(201).json({
-            message: 'User registered successfully',
-            user: {
-                id: userId,
-                email,
-                firstName,
-                lastName,
-                storageQuota: '107374182400',
-                storageUsed: '0',
-                createdAt: new Date().toISOString()
-            },
-            tokens: {
-                accessToken,
-                refreshToken,
-                expiresIn: '7d'
-            },
-            sessionId
-        });
-
-    } catch (error) {
-        console.error('Registration error:', error);
-        res.status(500).json({
-            error: 'Registration failed',
-            message: 'An internal server error occurred'
-        });
-    }
-});
-
-// User Login
-app.post('/api/auth/login', async (req, res) => {
-    try {
-        const { email, password, deviceName, deviceType, deviceId } = req.body;
-
-        // Find user
-        const user = await dbGet(`
-            SELECT id, email, password_hash, first_name, last_name, 
-                   storage_quota, storage_used, is_active
-            FROM users WHERE email = ? AND is_active = 1
-        `, [email]);
-
-        if (!user) {
-            return res.status(401).json({
-                error: 'Invalid credentials',
-                message: 'Email or password is incorrect'
-            });
-        }
-
-        // Verify password
-        const isPasswordValid = await bcrypt.compare(password, user.password_hash);
-        if (!isPasswordValid) {
-            return res.status(401).json({
-                error: 'Invalid credentials',
-                message: 'Email or password is incorrect'
-            });
-        }
-
-        // Invalidate old sessions for this device
-        await dbRun(`
-            DELETE FROM user_sessions 
-            WHERE user_id = ? AND device_id = ? AND device_type = ?
-        `, [user.id, deviceId, deviceType]);
-
-        // Create new session
-        const sessionId = uuidv4();
-        const tokenPayload = { userId: user.id, sessionId, email: user.email };
-        const accessToken = jwt.sign(tokenPayload, process.env.JWT_SECRET || 'fallback_secret', {
-            expiresIn: '7d'
-        });
-        const refreshToken = jwt.sign({ ...tokenPayload, type: 'refresh' }, process.env.JWT_SECRET || 'fallback_secret', {
-            expiresIn: '30d'
-        });
-
-        const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
-
-        await dbRun(`
-            INSERT INTO user_sessions (id, user_id, device_id, device_name, device_type,
-                                     access_token_hash, refresh_token_hash, expires_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        `, [sessionId, user.id, deviceId, deviceName || `${deviceType} Device`, deviceType,
-            await bcrypt.hash(accessToken, 5), await bcrypt.hash(refreshToken, 5), expiresAt]);
-
-        console.log(`✅ User logged in: ${email}`);
-
-        res.json({
-            message: 'Login successful',
-            user: {
-                id: user.id,
-                email: user.email,
-                firstName: user.first_name,
-                lastName: user.last_name,
-                storageQuota: user.storage_quota,
-                storageUsed: user.storage_used
-            },
-            tokens: {
-                accessToken,
-                refreshToken,
-                expiresIn: '7d'
-            },
-            sessionId
-        });
-
-    } catch (error) {
-        console.error('Login error:', error);
-        res.status(500).json({
-            error: 'Login failed',
-            message: 'An internal server error occurred'
-        });
-    }
-});
-
-// =============================================================================
-// 🔗 LEGACY COMPATIBILITY ENDPOINTS
-// =============================================================================
-
-// Simple upload (your Android app uses this)
-app.post('/upload', upload.single('file'), async (req, res) => {
-    try {
-        if (!req.file) {
-            return res.status(400).json({
-                error: 'No file provided',
-                message: 'Please select a file to upload'
-            });
-        }
-
-        console.log(`📤 File uploaded: ${req.file.originalname} (${req.file.size} bytes)`);
-        
-        res.json({
-            message: 'File uploaded successfully',
-            filename: req.file.originalname,
-            size: req.file.size,
-            uploadPath: req.file.path,
-            timestamp: new Date().toISOString()
-        });
-
-    } catch (error) {
-        console.error('Upload error:', error);
-        res.status(500).json({
-            error: 'Upload failed',
-            message: 'An internal server error occurred'
-        });
-    }
-});
-
-// Simple download (your Android app uses this)
-// Fixed download endpoint - serves specific files
-app.get('/download', async (req, res) => {
-    try {
-        const { file, user } = req.query;
-        
-        if (!file) {
-            return res.status(400).json({
-                error: 'File parameter required',
-                message: 'Please specify a file to download'
-            });
-        }
-
-        console.log(`📥 Download requested: ${file} by ${user || 'anonymous'}`);
-        
-        const uploadsDir = process.env.UPLOAD_PATH || './uploads';
-        
-        // 🔧 FIX: Look for specific file, not just latest
-        const uploadedFiles = await fs.readdir(uploadsDir);
-        
-        // Try to find exact match first
-        let targetFile = uploadedFiles.find(f => f === file);
-        
-        // If no exact match, try partial match (for legacy compatibility)
-        if (!targetFile) {
-            targetFile = uploadedFiles.find(f => f.includes(file.replace('.dat', '')));
-        }
-        
-        // 🚨 CRITICAL FIX: Don't just use latest file!
-        if (!targetFile) {
-            // Only fallback to latest if specifically requested
-            if (file === 'encrypted_backup.dat' || file === 'latest') {
-                const fileStats = await Promise.all(
-                    uploadedFiles.map(async filename => ({
-                        name: filename,
-                        path: `${uploadsDir}/${filename}`,
-                        time: (await fs.stat(`${uploadsDir}/${filename}`)).mtime.getTime()
-                    }))
-                );
-                
-                if (fileStats.length === 0) {
-                    return res.status(404).json({
-                        error: 'No files found',
-                        message: 'No uploaded files available'
-                    });
-                }
-                
-                targetFile = fileStats.sort((a, b) => b.time - a.time)[0].name;
-                console.log(`📂 Serving latest file: ${targetFile}`);
-            } else {
-                return res.status(404).json({
-                    error: 'File not found',
-                    message: `File '${file}' not found on server`
-                });
-            }
-        } else {
-            console.log(`📂 Serving specific file: ${targetFile}`);
-        }
-
-        const filePath = `${uploadsDir}/${targetFile}`;
-        
-        // Verify file exists
-        try {
-            await fs.access(filePath);
-        } catch (error) {
-            return res.status(404).json({
-                error: 'File not accessible',
-                message: 'File exists but cannot be accessed'
-            });
-        }
-        
-        res.setHeader('Content-Disposition', `attachment; filename="${file}"`);
-        res.setHeader('Content-Type', 'application/octet-stream');
-        
-        const fileStream = require('fs').createReadStream(filePath);
-        fileStream.pipe(res);
-
-    } catch (error) {
-        console.error('Download error:', error);
-        res.status(500).json({
-            error: 'Download failed',
-            message: 'An internal server error occurred'
-        });
-    }
-});
-
-
-// =============================================================================
-// 🚨 ERROR HANDLING
-// =============================================================================
-
-app.use('*', (req, res) => {
-    res.status(404).json({
-        error: 'Not Found',
-        message: `Route ${req.method} ${req.originalUrl} not found`,
-        timestamp: new Date().toISOString()
-    });
-});
-
-app.use((error, req, res, next) => {
-    console.error('Global error handler:', error);
-    
-    res.status(error.status || 500).json({
-        error: 'Internal Server Error',
-        message: process.env.NODE_ENV === 'development' ? error.message : 'Something went wrong',
-        timestamp: new Date().toISOString()
-    });
-});
-
-// =============================================================================
-// 🚀 START SERVER
-// =============================================================================
-
+// --------- START ---------
 app.listen(PORT, () => {
-    console.log(`
-🚀 CloudBackup SQLite Server Started!
-
-   Environment: ${process.env.NODE_ENV || 'development'}
-   Server:      http://localhost:${PORT}
-   Health:      http://localhost:${PORT}/health
-   Database:    SQLite Connected
-   
-   📊 Production Features:
-   ✅ SQLite database persistence  
-   ✅ JWT authentication with sessions
-   ✅ File upload/download working
-   ✅ Storage management
-   ✅ Security headers & rate limiting
-   ✅ Legacy compatibility (your Android app will work!)
-   
-   🔐 Ready for testing!
-    `);
-});
-
-// Graceful shutdown
-process.on('SIGTERM', () => {
-    console.log('SIGTERM received. Shutting down gracefully...');
-    db.close();
-    process.exit(0);
-});
-
-process.on('SIGINT', () => {
-    console.log('SIGINT received. Shutting down gracefully...');
-    db.close();
-    process.exit(0);
+  console.log(`🚀 Server running on port ${PORT} in ${NODE_ENV} mode`);
 });
