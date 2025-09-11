@@ -27,7 +27,7 @@ if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
 
-// --------- MIDDLEWARE ---------
+// --------- MIDDLEWARE (basic, session configured later) ---------
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
@@ -42,8 +42,7 @@ app.use(cors({
   credentials: true
 }));
 
-// --------- DATABASE SETUP (Postgres in PROD) ---------
-const DATABASE_URL = process.env.DATABASE_URL || '';
+// --------- DATABASE SETUP (Postgres in PROD, SQLite fallback) ---------
 let isPostgres = false;
 let pool = null;
 let dbRun, dbGet, dbAll;
@@ -59,139 +58,94 @@ function convertPlaceholders(query, params = []) {
   return { text, values: params };
 }
 
-const connStr = process.env.DATABASE_PUBLIC_URL || process.env.DATABASE_URL || '';
-
-
-if (connStr && connStr.startsWith('postgresql://')) {
-  isPostgres = true;
+// Try to connect to a Postgres pool with the provided options and return the pool on success
+async function tryConnect({ name, connectionString, ssl }) {
   const { Pool } = require('pg');
-  let sslOption = false;
+  console.log(`Attempting Postgres connection using: ${name} -> ${connectionString.includes('@') ? connectionString.split('@')[1] : connectionString}`);
+  const candidatePool = new Pool({ connectionString, ssl });
   try {
-    const lower = connStr.toLowerCase();
-    if (lower.includes('.proxy.rlwy.net') || lower.includes('tramway.proxy.rlwy.net') || lower.includes('proxy.rlwy.net')) {
-      // public proxy -> use TLS but allow Railway certs
-      sslOption = { rejectUnauthorized: false };
-    } else if (lower.includes('.railway.internal')) {
-      // internal host -> typically no TLS
-      sslOption = false;
-    } else {
-      // default to TLS but allow self-signed-like certs
-      sslOption = { rejectUnauthorized: false };
-    }
-  } catch (e) {
-    sslOption = { rejectUnauthorized: false };
-  }
-
-
-  pool = new Pool({
-    connectionString: connStr,
-    ssl: sslOption
-  });
-
-  pool.connect()
-  .then(client => {
+    const client = await candidatePool.connect();
     client.release();
-    console.log('✅ Postgres connection established (using connectionString from env).');
-  })
-  .catch(err => {
-    console.error('❌ Postgres connection test failed:', err);
-    // Exit so Railway shows a failing deployment and you can see the error in logs
-    process.exit(1);
-  });
-
- pool.connect()
-    .then(client => {
-      client.release();
-      console.log('✅ Postgres connection established (using connectionString from env).');
-    })
-    .catch(err => {
-      console.error('❌ Postgres connection test failed:', err.message || err);
-    });
-
-  dbRun = async (query, params = []) => {
-    const { text, values } = convertPlaceholders(query, params);
-    const client = await pool.connect();
-    try {
-      return await client.query(text, values);
-    } finally {
-      client.release();
-    }
-  };
-
-  dbGet = async (query, params = []) => {
-    const { text, values } = convertPlaceholders(query, params);
-    const client = await pool.connect();
-    try {
-      const result = await client.query(text, values);
-      return result.rows[0];
-    } finally {
-      client.release();
-    }
-  };
-
-  dbAll = async (query, params = []) => {
-    const { text, values } = convertPlaceholders(query, params);
-    const client = await pool.connect();
-    try {
-      const result = await client.query(text, values);
-      return result.rows;
-    } finally {
-      client.release();
-    }
-  };
-} else {
-  // fallback to sqlite for local/dev only
-  const Database = require('sqlite3').Database;
-  const dbPath = './cloudbackup.db';
-  const db = new Database(dbPath);
-
-  dbRun = (query, params = []) => new Promise((resolve, reject) => {
-    db.run(query, params, function(err) {
-      if (err) reject(err);
-      else resolve({ changes: this.changes, lastID: this.lastID });
-    });
-  });
-
-  dbGet = (query, params = []) => new Promise((resolve, reject) => {
-    db.get(query, params, (err, row) => {
-      if (err) reject(err);
-      else resolve(row);
-    });
-  });
-
-  dbAll = (query, params = []) => new Promise((resolve, reject) => {
-    db.all(query, params, (err, rows) => {
-      if (err) reject(err);
-      else resolve(rows);
-    });
-  });
+    console.log(`✅ Connected to Postgres via ${name}`);
+    return candidatePool;
+  } catch (err) {
+    // print full stack for debugging
+    console.error(`❌ Postgres attempt (${name}) failed:`, err && err.stack ? err.stack : err);
+    try { await candidatePool.end(); } catch (e) {}
+    throw err;
+  }
 }
 
-// --------- Use a persistent session store in production (Postgres) ---------
-if (isPostgres) {
-  const PgSession = require('connect-pg-simple')(session);
-  app.use(session({
-    store: new PgSession({
-      pool: pool,                // uses same pg pool
-      tableName: 'session'       // optional; default 'session'
-    }),
-    secret: SESSION_SECRET,
-    resave: false,
-    saveUninitialized: false,
-    cookie: {
-      secure: NODE_ENV === 'production',
-      httpOnly: true,
-      sameSite: NODE_ENV === 'production' ? 'none' : 'lax'
+// Attempt candidates in order (internal first, then public proxy)
+async function createPostgresPoolOrThrow() {
+  const candidates = [];
+
+  if (process.env.DATABASE_URL) {
+    candidates.push({
+      name: 'internal (DATABASE_URL)',
+      connectionString: process.env.DATABASE_URL,
+      ssl: false
+    });
+  }
+
+  if (process.env.DATABASE_PUBLIC_URL) {
+    candidates.push({
+      name: 'public proxy (DATABASE_PUBLIC_URL)',
+      connectionString: process.env.DATABASE_PUBLIC_URL,
+      ssl: { rejectUnauthorized: false }
+    });
+  }
+
+  if (candidates.length === 0) {
+    throw new Error('No DATABASE_URL or DATABASE_PUBLIC_URL provided in env');
+  }
+
+  let lastErr = null;
+  for (const c of candidates) {
+    try {
+      const p = await tryConnect(c);
+      return p;
+    } catch (err) {
+      lastErr = err;
     }
-  }));
-} else {
-  // memory store for local dev (not for prod)
-  app.use(session({
-    secret: SESSION_SECRET,
-    resave: false,
-    saveUninitialized: false,
-    cookie: { secure: false }
-  }));
+  }
+
+  const msg = lastErr ? `All Postgres connection attempts failed. Last error: ${lastErr.message || lastErr}` : 'All Postgres connection attempts failed';
+  const e = new Error(msg);
+  e.original = lastErr;
+  throw e;
+}
+
+// --------- Session config helper (called after pool decision) ---------
+function configureSession(app, poolIfAny) {
+  if (poolIfAny) {
+    // use Postgres-backed session store
+    const PgSession = require('connect-pg-simple')(session);
+    app.use(session({
+      store: new PgSession({
+        pool: poolIfAny,
+        tableName: 'session'
+      }),
+      secret: SESSION_SECRET,
+      resave: false,
+      saveUninitialized: false,
+      cookie: {
+        secure: NODE_ENV === 'production',
+        httpOnly: true,
+        sameSite: NODE_ENV === 'production' ? 'none' : 'lax'
+      }
+    }));
+    console.log('✅ Using Postgres session store (connect-pg-simple).');
+  } else {
+    // memory store (dev only)
+    app.use(session({
+      secret: SESSION_SECRET,
+      resave: false,
+      saveUninitialized: false,
+      cookie: { secure: false }
+    }));
+    console.log('⚠️ Using Memory session store (development only).');
+  }
 }
 
 // --------- MULTER ---------
@@ -221,7 +175,7 @@ function authMiddleware(req, res, next) {
 async function initDatabase() {
   try {
     if (isPostgres) {
-      // Run Postgres-compatible CREATE TABLE IF NOT EXISTS statements
+      // create Postgres tables
       await dbRun(`
         CREATE TABLE IF NOT EXISTS users (
           id VARCHAR(36) PRIMARY KEY,
@@ -260,17 +214,20 @@ async function initDatabase() {
         );
       `);
 
-      // session table used by connect-pg-simple (if not exists)
-      await dbRun(`
-        CREATE TABLE IF NOT EXISTS session (
-          sid varchar NOT NULL COLLATE "default",
-          sess json NOT NULL,
-          expire timestamp(6) NOT NULL
-        )
-        WITH (OIDS=FALSE);
-      `).catch(()=>{/* ignore if pg driver uses its own creation */});
+      // session table (connect-pg-simple), if needed
+      try {
+        await dbRun(`
+          CREATE TABLE IF NOT EXISTS session (
+            sid varchar NOT NULL COLLATE "default",
+            sess json NOT NULL,
+            expire timestamp(6) NOT NULL
+          ) WITH (OIDS=FALSE);
+        `);
+      } catch (_) {
+        // ignore if the store manages creation
+      }
     } else {
-      // SQLite schema
+      // sqlite fallback
       await dbRun(`
         CREATE TABLE IF NOT EXISTS users (
           id TEXT PRIMARY KEY,
@@ -314,115 +271,189 @@ async function initDatabase() {
 
     console.log('✅ Database initialized successfully');
   } catch (err) {
-    console.error('❌ Database initialization error:', err);
+    console.error('❌ Database initialization error:', err && err.stack ? err.stack : err);
     throw err;
   }
 }
 
-// --------- ROUTES (uses password_hash now) ---------
-
-// register
+// --------- ROUTES ---------
+// Registration
 app.post('/api/register', async (req, res) => {
   try {
     const { email, password, firstName = '', lastName = '' } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'Missing email or password' });
-
     const hash = await bcrypt.hash(password, BCRYPT_ROUNDS);
     const id = uuidv4();
-
-    await dbRun(
-      `INSERT INTO users (id, email, password_hash, first_name, last_name) VALUES (?, ?, ?, ?, ?)`,
-      [id, email, hash, firstName, lastName]
-    );
-
+    await dbRun('INSERT INTO users (id, email, password_hash, first_name, last_name) VALUES (?, ?, ?, ?, ?)', [id, email, hash, firstName, lastName]);
     res.json({ success: true, id });
   } catch (err) {
-    console.error('Register error', err);
+    console.error('Register error', err && err.stack ? err.stack : err);
     res.status(500).json({ error: 'Registration failed' });
   }
 });
 
-// login
+// Login
 app.post('/api/login', async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'Missing email or password' });
-
     const user = await dbGet('SELECT * FROM users WHERE email = ?', [email]);
     if (!user) return res.status(400).json({ error: 'Invalid credentials' });
-
     const match = await bcrypt.compare(password, user.password_hash);
     if (!match) return res.status(400).json({ error: 'Invalid credentials' });
-
     const token = generateToken(user);
     res.json({ token });
   } catch (err) {
-    console.error('Login error', err);
+    console.error('Login error', err && err.stack ? err.stack : err);
     res.status(500).json({ error: 'Login failed' });
   }
 });
 
-// rest of routes (upload/list/download) unchanged but they rely on dbRun/dbGet/dbAll
+// Upload file
 app.post('/api/upload', authMiddleware, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
     const { originalname, filename, mimetype, size, path: filePath } = req.file;
     const fileId = uuidv4();
-
     await dbRun(
       `INSERT INTO files (id, user_id, filename, original_name, file_path, file_size, mime_type)
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
       [fileId, req.user.id, filename, originalname, filePath, size, mimetype]
     );
-
     res.json({ success: true, fileId });
   } catch (err) {
-    console.error('Upload error', err);
+    console.error('Upload error', err && err.stack ? err.stack : err);
     res.status(500).json({ error: 'Upload failed' });
   }
 });
 
+// List files
 app.get('/api/files', authMiddleware, async (req, res) => {
   try {
-    const files = await dbAll('SELECT * FROM files WHERE user_id = ?', [req.user.id]);
+    const files = await dbAll('SELECT * FROM files WHERE user_id = ? ORDER BY uploaded_at DESC', [req.user.id]);
     res.json({ files });
   } catch (err) {
-    console.error('List files error', err);
+    console.error('List files error', err && err.stack ? err.stack : err);
     res.status(500).json({ error: 'Could not list files' });
   }
 });
 
+// Download file
 app.get('/api/files/:id/download', authMiddleware, async (req, res) => {
   try {
     const fileId = req.params.id;
     const fileRow = await dbGet('SELECT * FROM files WHERE id = ?', [fileId]);
     if (!fileRow) return res.status(404).json({ error: 'File not found' });
     if (fileRow.user_id !== req.user.id) return res.status(403).json({ error: 'Access denied' });
-
     const absPath = path.resolve(fileRow.file_path);
-    if (!absPath.startsWith(uploadsDir)) {
-      return res.status(400).json({ error: 'Invalid file path' });
-    }
+    if (!absPath.startsWith(uploadsDir)) return res.status(400).json({ error: 'Invalid file path' });
     if (!fs.existsSync(absPath)) return res.status(404).json({ error: 'File not found on disk' });
-
     res.setHeader('Content-Type', fileRow.mime_type || 'application/octet-stream');
     res.setHeader('Content-Disposition', `attachment; filename="${fileRow.original_name || fileRow.filename}"`);
     fs.createReadStream(absPath).pipe(res);
   } catch (err) {
-    console.error('Download error', err);
+    console.error('Download error', err && err.stack ? err.stack : err);
     res.status(500).json({ error: 'Download failed' });
   }
 });
 
-// --------- START ---------
+// Health check
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    environment: NODE_ENV
+  });
+});
+
+// --------- START (decide DB, configure session, init DB, start server) ---------
 (async function start() {
   try {
+    // Attempt Postgres if env vars exist
+    if ((process.env.DATABASE_URL && process.env.DATABASE_URL.startsWith('postgresql://')) ||
+        (process.env.DATABASE_PUBLIC_URL && process.env.DATABASE_PUBLIC_URL.startsWith('postgresql://'))) {
+      try {
+        pool = await createPostgresPoolOrThrow();
+        isPostgres = true;
+
+        // wire db helpers to pool
+        dbRun = async (query, params = []) => {
+          const { text, values } = convertPlaceholders(query, params);
+          const client = await pool.connect();
+          try { return await client.query(text, values); }
+          finally { client.release(); }
+        };
+
+        dbGet = async (query, params = []) => {
+          const { text, values } = convertPlaceholders(query, params);
+          const client = await pool.connect();
+          try {
+            const result = await client.query(text, values);
+            return result.rows[0];
+          } finally { client.release(); }
+        };
+
+        dbAll = async (query, params = []) => {
+          const { text, values } = convertPlaceholders(query, params);
+          const client = await pool.connect();
+          try {
+            const result = await client.query(text, values);
+            return result.rows;
+          } finally { client.release(); }
+        };
+
+      } catch (err) {
+        console.error('❌ Could not connect to Postgres (both internal and public attempts failed). Falling back to SQLite if available. Error:', err && err.stack ? err.stack : err);
+        // fall through to sqlite below if desired
+      }
+    }
+
+    // If we didn't set dbRun/dbGet/dbAll from Postgres, set up sqlite fallback
+    if (!dbRun || !dbGet || !dbAll) {
+      // sqlite fallback
+      const Database = require('sqlite3').Database;
+      const dbPath = './cloudbackup.db';
+      const sqliteDb = new Database(dbPath);
+
+      dbRun = (query, params = []) => new Promise((resolve, reject) => {
+        sqliteDb.run(query, params, function(err) {
+          if (err) reject(err);
+          else resolve({ changes: this.changes, lastID: this.lastID });
+        });
+      });
+
+      dbGet = (query, params = []) => new Promise((resolve, reject) => {
+        sqliteDb.get(query, params, (err, row) => {
+          if (err) reject(err);
+          else resolve(row);
+        });
+      });
+
+      dbAll = (query, params = []) => new Promise((resolve, reject) => {
+        sqliteDb.all(query, params, (err, rows) => {
+          if (err) reject(err);
+          else resolve(rows);
+        });
+      });
+
+      console.log('⚠️ Using SQLite fallback (local development).');
+    }
+
+    // Configure session store now that we have either pool or not
+    configureSession(app, pool);
+
+    // Initialize DB (create tables)
     await initDatabase();
+
+    // Start server
     app.listen(PORT, () => {
       console.log(`🚀 Server running on port ${PORT} in ${NODE_ENV} mode`);
+      console.log(`🔗 Health check: http://localhost:${PORT}/health (or your deployed host)`);
     });
+
   } catch (err) {
-    console.error('❌ Failed to start server:', err);
+    console.error('❌ Failed to start server:', err && err.stack ? err.stack : err);
     process.exit(1);
   }
 })();
