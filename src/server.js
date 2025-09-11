@@ -1,459 +1,723 @@
-// src/server.js
-require('dotenv').config();
 const express = require('express');
-const session = require('express-session');
-const bodyParser = require('body-parser');
-const multer = require('multer');
 const cors = require('cors');
-const { v4: uuidv4 } = require('uuid');
+const morgan = require('morgan');
+const helmet = require('helmet');
+const compression = require('compression');
+const rateLimit = require('express-rate-limit');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const fs = require('fs');
-const path = require('path');
+const { v4: uuidv4 } = require('uuid');
+const Joi = require('joi');
+const passport = require('passport');
+const GoogleStrategy = require('passport-google-oauth20').Strategy;
+const session = require('express-session');
+require('dotenv').config();
 
+// Database setup (PostgreSQL or SQLite)
+let db, dbRun, dbGet, dbAll;
+const DATABASE_URL = process.env.DATABASE_URL;
+
+if (DATABASE_URL && DATABASE_URL.startsWith('postgresql://')) {
+    // PostgreSQL setup
+    const { Pool } = require('pg');
+    const pool = new Pool({ connectionString: DATABASE_URL });
+    
+    dbRun = async (query, params = []) => {
+        const client = await pool.connect();
+        try {
+            const result = await client.query(query, params);
+            return result;
+        } finally {
+            client.release();
+        }
+    };
+    
+    dbGet = async (query, params = []) => {
+        const client = await pool.connect();
+        try {
+            const result = await client.query(query, params);
+            return result.rows[0];
+        } finally {
+            client.release();
+        }
+    };
+    
+    dbAll = async (query, params = []) => {
+        const client = await pool.connect();
+        try {
+            const result = await client.query(query, params);
+            return result.rows;
+        } finally {
+            client.release();
+        }
+    };
+} else {
+    // SQLite setup
+    const Database = require('sqlite3').Database;
+    const dbPath = './cloudbackup.db';
+    db = new Database(dbPath);
+    
+    dbRun = (query, params = []) => {
+        return new Promise((resolve, reject) => {
+            db.run(query, params, function(err) {
+                if (err) reject(err);
+                else resolve({ changes: this.changes, lastID: this.lastID });
+            });
+        });
+    };
+    
+    dbGet = (query, params = []) => {
+        return new Promise((resolve, reject) => {
+            db.get(query, params, (err, row) => {
+                if (err) reject(err);
+                else resolve(row);
+            });
+        });
+    };
+    
+    dbAll = (query, params = []) => {
+        return new Promise((resolve, reject) => {
+            db.all(query, params, (err, rows) => {
+                if (err) reject(err);
+                else resolve(rows);
+            });
+        });
+    };
+}
+
+// Initialize Express app
 const app = express();
 
-// --------- CONFIG ---------
-const PORT = process.env.PORT || 3000;
-const NODE_ENV = process.env.NODE_ENV || 'development';
-const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret';
-const SESSION_SECRET = process.env.SESSION_SECRET || 'dev_session_secret';
-const UPLOAD_PATH = process.env.UPLOAD_PATH || './uploads';
-const BCRYPT_ROUNDS = parseInt(process.env.BCRYPT_ROUNDS || '12', 10);
+// =============================================================================
+// 🛡️ SECURITY & MIDDLEWARE
+// =============================================================================
 
-// ensure upload dir exists
-const uploadsDir = path.resolve(UPLOAD_PATH);
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
-}
-
-// --------- MIDDLEWARE (basic, session configured later) ---------
-app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: true }));
-
-const allowedOrigins = [
-  'http://localhost:3000',
-  'http://127.0.0.1:3000'
-];
-if (process.env.FRONTEND_URL) allowedOrigins.push(process.env.FRONTEND_URL);
-
+app.use(helmet());
+app.use(compression());
 app.use(cors({
-  origin: allowedOrigins,
-  credentials: true
+    origin: ['http://localhost:3000', 'http://127.0.0.1:3000'],
+    credentials: true
+}));
+app.use(morgan('combined'));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+// Rate limiting
+const limiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 1000,
+    message: { error: 'Too many requests from this IP, please try again later.' }
+});
+app.use(limiter);
+
+// =============================================================================
+// 🔐 SESSION & PASSPORT CONFIGURATION
+// =============================================================================
+
+// Session configuration
+app.use(session({
+    secret: process.env.SESSION_SECRET || 'your-session-secret-change-this',
+    resave: false,
+    saveUninitialized: false,
+    cookie: { 
+        secure: process.env.NODE_ENV === 'production',
+        maxAge: 24 * 60 * 60 * 1000 // 24 hours
+    }
 }));
 
-// --------- DATABASE SETUP (Postgres in PROD, SQLite fallback) ---------
-let isPostgres = false;
-let pool = null;
-let dbRun, dbGet, dbAll;
+app.use(passport.initialize());
+app.use(passport.session());
 
-// Convert ? placeholders to $1, $2 for Postgres
-function convertPlaceholders(query, params = []) {
-  if (!isPostgres) return { text: query, values: params };
-  let idx = 0;
-  const text = query.replace(/\?/g, () => {
-    idx++;
-    return `$${idx}`;
-  });
-  return { text, values: params };
-}
-
-// Try to connect to a Postgres pool with the provided options and return the pool on success
-async function tryConnect({ name, connectionString, ssl }) {
-  const { Pool } = require('pg');
-  console.log(`Attempting Postgres connection using: ${name} -> ${connectionString.includes('@') ? connectionString.split('@')[1] : connectionString}`);
-  const candidatePool = new Pool({ connectionString, ssl });
-  try {
-    const client = await candidatePool.connect();
-    client.release();
-    console.log(`✅ Connected to Postgres via ${name}`);
-    return candidatePool;
-  } catch (err) {
-    // print full stack for debugging
-    console.error(`❌ Postgres attempt (${name}) failed:`, err && err.stack ? err.stack : err);
-    try { await candidatePool.end(); } catch (e) {}
-    throw err;
-  }
-}
-
-// Attempt candidates in order (internal first, then public proxy)
-async function createPostgresPoolOrThrow() {
-  const candidates = [];
-
-  if (process.env.DATABASE_URL) {
-    candidates.push({
-      name: 'internal (DATABASE_URL)',
-      connectionString: process.env.DATABASE_URL,
-      ssl: false
-    });
-  }
-
-  if (process.env.DATABASE_PUBLIC_URL) {
-    candidates.push({
-      name: 'public proxy (DATABASE_PUBLIC_URL)',
-      connectionString: process.env.DATABASE_PUBLIC_URL,
-      ssl: { rejectUnauthorized: false }
-    });
-  }
-
-  if (candidates.length === 0) {
-    throw new Error('No DATABASE_URL or DATABASE_PUBLIC_URL provided in env');
-  }
-
-  let lastErr = null;
-  for (const c of candidates) {
+// Google OAuth Strategy
+passport.use(new GoogleStrategy({
+    clientID: process.env.GOOGLE_CLIENT_ID,
+    clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+    callbackURL: process.env.GOOGLE_CALLBACK_URL || "http://localhost:3000/auth/google/callback"
+}, async (accessToken, refreshToken, profile, done) => {
     try {
-      const p = await tryConnect(c);
-      return p;
-    } catch (err) {
-      lastErr = err;
+        console.log('🔑 Google OAuth profile received:', {
+            id: profile.id,
+            email: profile.emails?.[0]?.value,
+            name: profile.displayName
+        });
+        
+        if (!profile.emails || profile.emails.length === 0) {
+            return done(new Error('No email provided by Google'), null);
+        }
+        
+        const email = profile.emails[0].value;
+        
+        // Check if user exists
+        let user = await dbGet('SELECT * FROM users WHERE email = ?', [email]);
+        
+        if (!user) {
+            // Create new user from Google profile
+            const userId = uuidv4();
+            await dbRun(`
+                INSERT INTO users (id, email, password_hash, first_name, last_name)
+                VALUES (?, ?, ?, ?, ?)
+            `, [
+                userId, 
+                email,
+                'google_oauth', // Special marker for OAuth users
+                profile.name?.givenName || 'Google',
+                profile.name?.familyName || 'User'
+            ]);
+            
+            user = await dbGet('SELECT * FROM users WHERE id = ?', [userId]);
+            console.log('✅ Created new user from Google OAuth:', email);
+        } else {
+            console.log('✅ Existing user logged in via Google OAuth:', email);
+        }
+        
+        return done(null, user);
+    } catch (error) {
+        console.error('❌ Google OAuth error:', error);
+        return done(error, null);
     }
-  }
+}));
 
-  const msg = lastErr ? `All Postgres connection attempts failed. Last error: ${lastErr.message || lastErr}` : 'All Postgres connection attempts failed';
-  const e = new Error(msg);
-  e.original = lastErr;
-  throw e;
-}
-
-// --------- Session config helper (called after pool decision) ---------
-function configureSession(app, poolIfAny) {
-  if (poolIfAny) {
-    // use Postgres-backed session store
-    const PgSession = require('connect-pg-simple')(session);
-    app.use(session({
-      store: new PgSession({
-        pool: poolIfAny,
-        tableName: 'session'
-      }),
-      secret: SESSION_SECRET,
-      resave: false,
-      saveUninitialized: false,
-      cookie: {
-        secure: NODE_ENV === 'production',
-        httpOnly: true,
-        sameSite: NODE_ENV === 'production' ? 'none' : 'lax'
-      }
-    }));
-    console.log('✅ Using Postgres session store (connect-pg-simple).');
-  } else {
-    // memory store (dev only)
-    app.use(session({
-      secret: SESSION_SECRET,
-      resave: false,
-      saveUninitialized: false,
-      cookie: { secure: false }
-    }));
-    console.log('⚠️ Using Memory session store (development only).');
-  }
-}
-
-// --------- MULTER ---------
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadsDir),
-  filename: (req, file, cb) => cb(null, `${uuidv4()}_${file.originalname}`)
+// Serialize user for session
+passport.serializeUser((user, done) => {
+    done(null, user.id);
 });
-const upload = multer({ storage });
 
-// --------- AUTH HELPERS ---------
-function generateToken(user) {
-  return jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN || '7d' });
-}
-
-function authMiddleware(req, res, next) {
-  const header = req.headers['authorization'];
-  if (!header) return res.status(401).json({ error: 'Missing token' });
-  const token = header.split(' ')[1];
-  jwt.verify(token, JWT_SECRET, (err, decoded) => {
-    if (err) return res.status(403).json({ error: 'Invalid token' });
-    req.user = decoded;
-    next();
-  });
-}
-
-// --------- AUTO MIGRATIONS (CREATE TABLES IF MISSING) ---------
-async function initDatabase() {
-  try {
-    if (isPostgres) {
-      // create Postgres tables
-      await dbRun(`
-        CREATE TABLE IF NOT EXISTS users (
-          id VARCHAR(36) PRIMARY KEY,
-          email VARCHAR(255) UNIQUE NOT NULL,
-          password_hash TEXT NOT NULL,
-          first_name VARCHAR(100),
-          last_name VARCHAR(100),
-          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-      `);
-
-      await dbRun(`
-        CREATE TABLE IF NOT EXISTS user_sessions (
-          id VARCHAR(36) PRIMARY KEY,
-          user_id VARCHAR(36) REFERENCES users(id) ON DELETE CASCADE,
-          device_id VARCHAR(100),
-          device_name VARCHAR(100),
-          device_type VARCHAR(20),
-          access_token_hash TEXT,
-          refresh_token_hash TEXT,
-          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-          expires_at TIMESTAMP
-        );
-      `);
-
-      await dbRun(`
-        CREATE TABLE IF NOT EXISTS files (
-          id VARCHAR(36) PRIMARY KEY,
-          user_id VARCHAR(36) REFERENCES users(id) ON DELETE CASCADE,
-          filename VARCHAR(255) NOT NULL,
-          original_name VARCHAR(255),
-          file_path TEXT NOT NULL,
-          file_size BIGINT,
-          mime_type VARCHAR(100),
-          uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-      `);
-
-      // session table (connect-pg-simple), if needed
-      try {
-        await dbRun(`
-          CREATE TABLE IF NOT EXISTS session (
-            sid varchar NOT NULL COLLATE "default",
-            sess json NOT NULL,
-            expire timestamp(6) NOT NULL
-          ) WITH (OIDS=FALSE);
-        `);
-      } catch (_) {
-        // ignore if the store manages creation
-      }
-    } else {
-      // sqlite fallback
-      await dbRun(`
-        CREATE TABLE IF NOT EXISTS users (
-          id TEXT PRIMARY KEY,
-          email TEXT UNIQUE NOT NULL,
-          password_hash TEXT NOT NULL,
-          first_name TEXT,
-          last_name TEXT,
-          created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        );
-      `);
-
-      await dbRun(`
-        CREATE TABLE IF NOT EXISTS user_sessions (
-          id TEXT PRIMARY KEY,
-          user_id TEXT,
-          device_id TEXT,
-          device_name TEXT,
-          device_type TEXT,
-          access_token_hash TEXT,
-          refresh_token_hash TEXT,
-          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-          expires_at DATETIME,
-          FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
-        );
-      `);
-
-      await dbRun(`
-        CREATE TABLE IF NOT EXISTS files (
-          id TEXT PRIMARY KEY,
-          user_id TEXT,
-          filename TEXT NOT NULL,
-          original_name TEXT,
-          file_path TEXT NOT NULL,
-          file_size INTEGER,
-          mime_type TEXT,
-          uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-          FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
-        );
-      `);
+// Deserialize user from session
+passport.deserializeUser(async (id, done) => {
+    try {
+        const user = await dbGet('SELECT * FROM users WHERE id = ?', [id]);
+        done(null, user);
+    } catch (error) {
+        done(error, null);
     }
+});
 
-    console.log('✅ Database initialized successfully');
-  } catch (err) {
-    console.error('❌ Database initialization error:', err && err.stack ? err.stack : err);
-    throw err;
-  }
+// =============================================================================
+// 📁 FILE UPLOAD CONFIGURATION
+// =============================================================================
+
+const uploadsDir = process.env.UPLOAD_PATH || './uploads';
+if (!fs.existsSync(uploadsDir)) {
+    fs.mkdirSync(uploadsDir, { recursive: true });
 }
 
-// --------- ROUTES ---------
+const storage = multer.diskStorage({
+    destination: (req, file, cb) => cb(null, uploadsDir),
+    filename: (req, file, cb) => {
+        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+        cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
+    }
+});
+
+const upload = multer({
+    storage,
+    limits: { 
+        fileSize: parseInt(process.env.MAX_FILE_SIZE?.replace('MB', '')) * 1024 * 1024 || 100 * 1024 * 1024 
+    },
+    fileFilter: (req, file, cb) => {
+        cb(null, true);
+    }
+});
+
+// =============================================================================
+// 🔐 AUTHENTICATION MIDDLEWARE
+// =============================================================================
+
+const authMiddleware = async (req, res, next) => {
+    try {
+        const authHeader = req.headers.authorization;
+        if (!authHeader || !authHeader.startsWith('Bearer ')) {
+            return res.status(401).json({ success: false, error: 'No token provided' });
+        }
+
+        const token = authHeader.substring(7);
+        const decoded = jwt.verify(token, process.env.JWT_SECRET || 'fallback_secret');
+        
+        const user = await dbGet('SELECT * FROM users WHERE id = ?', [decoded.userId]);
+        if (!user) {
+            return res.status(401).json({ success: false, error: 'User not found' });
+        }
+
+        req.user = { ...user, sessionId: decoded.sessionId };
+        next();
+    } catch (error) {
+        console.error('Auth middleware error:', error);
+        res.status(401).json({ success: false, error: 'Invalid token' });
+    }
+};
+
+// =============================================================================
+// 🗄️ DATABASE INITIALIZATION
+// =============================================================================
+
+const initDatabase = async () => {
+    try {
+        if (DATABASE_URL && DATABASE_URL.startsWith('postgresql://')) {
+            // PostgreSQL schema
+            await dbRun(`
+                CREATE TABLE IF NOT EXISTS users (
+                    id VARCHAR(36) PRIMARY KEY,
+                    email VARCHAR(255) UNIQUE NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    first_name VARCHAR(100),
+                    last_name VARCHAR(100),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            `);
+            
+            await dbRun(`
+                CREATE TABLE IF NOT EXISTS user_sessions (
+                    id VARCHAR(36) PRIMARY KEY,
+                    user_id VARCHAR(36) REFERENCES users(id) ON DELETE CASCADE,
+                    device_id VARCHAR(100),
+                    device_name VARCHAR(100),
+                    device_type VARCHAR(20),
+                    access_token_hash TEXT,
+                    refresh_token_hash TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    expires_at TIMESTAMP
+                )
+            `);
+            
+            await dbRun(`
+                CREATE TABLE IF NOT EXISTS files (
+                    id VARCHAR(36) PRIMARY KEY,
+                    user_id VARCHAR(36) REFERENCES users(id) ON DELETE CASCADE,
+                    filename VARCHAR(255) NOT NULL,
+                    original_name VARCHAR(255) NOT NULL,
+                    file_path TEXT NOT NULL,
+                    file_size BIGINT NOT NULL,
+                    mime_type VARCHAR(100),
+                    uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            `);
+        } else {
+            // SQLite schema
+            await dbRun(`
+                CREATE TABLE IF NOT EXISTS users (
+                    id TEXT PRIMARY KEY,
+                    email TEXT UNIQUE NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    first_name TEXT,
+                    last_name TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            `);
+            
+            await dbRun(`
+                CREATE TABLE IF NOT EXISTS user_sessions (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT,
+                    device_id TEXT,
+                    device_name TEXT,
+                    device_type TEXT,
+                    access_token_hash TEXT,
+                    refresh_token_hash TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    expires_at DATETIME,
+                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                )
+            `);
+            
+            await dbRun(`
+                CREATE TABLE IF NOT EXISTS files (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT,
+                    filename TEXT NOT NULL,
+                    original_name TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    file_size INTEGER NOT NULL,
+                    mime_type TEXT,
+                    uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                )
+            `);
+        }
+        
+        console.log('✅ Database initialized successfully');
+    } catch (error) {
+        console.error('❌ Database initialization error:', error);
+        throw error;
+    }
+};
+
+// =============================================================================
+// 🔑 GOOGLE OAUTH ENDPOINTS
+// =============================================================================
+
+// Start Google OAuth flow
+app.get('/auth/google',
+    passport.authenticate('google', { scope: ['profile', 'email'] })
+);
+
+// Google OAuth callback
+app.get('/auth/google/callback',
+    passport.authenticate('google', { failureRedirect: '/auth/google/error' }),
+    async (req, res) => {
+        try {
+            console.log('🎉 Google OAuth callback successful for:', req.user.email);
+            
+            // Create JWT tokens for API compatibility
+            const sessionId = uuidv4();
+            const tokenPayload = { 
+                userId: req.user.id, 
+                sessionId, 
+                email: req.user.email 
+            };
+            
+            const accessToken = jwt.sign(tokenPayload, process.env.JWT_SECRET || 'fallback_secret', {
+                expiresIn: '7d'
+            });
+            
+            const refreshToken = jwt.sign(
+                { ...tokenPayload, type: 'refresh' }, 
+                process.env.JWT_SECRET || 'fallback_secret', 
+                { expiresIn: '30d' }
+            );
+            
+            const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+            
+            // Store session in database
+            await dbRun(`
+                INSERT INTO user_sessions (id, user_id, device_id, device_name, device_type,
+                                         access_token_hash, refresh_token_hash, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            `, [
+                sessionId, req.user.id, 'oauth_web', 'Google OAuth Web', 'WEB',
+                await bcrypt.hash(accessToken, 5), 
+                await bcrypt.hash(refreshToken, 5), 
+                expiresAt
+            ]);
+            
+            // Return tokens as JSON (you can modify this to redirect to your frontend)
+            res.json({
+                success: true,
+                message: 'Google OAuth login successful',
+                user: {
+                    id: req.user.id,
+                    email: req.user.email,
+                    firstName: req.user.first_name,
+                    lastName: req.user.last_name
+                },
+                tokens: {
+                    accessToken,
+                    refreshToken,
+                    expiresIn: '7d'
+                },
+                sessionId
+            });
+            
+        } catch (error) {
+            console.error('OAuth callback error:', error);
+            res.status(500).json({ 
+                success: false,
+                error: 'OAuth login failed',
+                message: error.message 
+            });
+        }
+    }
+);
+
+// OAuth error handler
+app.get('/auth/google/error', (req, res) => {
+    res.status(400).json({
+        success: false,
+        error: 'Google OAuth failed',
+        message: 'Authentication with Google was unsuccessful'
+    });
+});
+
+// Check OAuth status
+app.get('/auth/status', authMiddleware, (req, res) => {
+    res.json({
+        authenticated: true,
+        method: 'jwt',
+        user: {
+            id: req.user.id,
+            email: req.user.email,
+            firstName: req.user.first_name,
+            lastName: req.user.last_name
+        }
+    });
+});
+
+// Logout endpoint
+app.post('/auth/logout', authMiddleware, async (req, res) => {
+    try {
+        // Remove session from database
+        await dbRun('DELETE FROM user_sessions WHERE id = ?', [req.user.sessionId]);
+        
+        // Logout from passport session
+        req.logout((err) => {
+            if (err) {
+                console.error('Logout error:', err);
+            }
+        });
+        
+        res.json({
+            success: true,
+            message: 'Logged out successfully'
+        });
+    } catch (error) {
+        console.error('Logout error:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Logout failed'
+        });
+    }
+});
+
+// =============================================================================
+// 🔐 AUTHENTICATION ENDPOINTS (Regular email/password)
+// =============================================================================
+
 // Registration
-app.post('/api/register', async (req, res) => {
-  try {
-    const { email, password, firstName = '', lastName = '' } = req.body;
-    if (!email || !password) return res.status(400).json({ error: 'Missing email or password' });
-    const hash = await bcrypt.hash(password, BCRYPT_ROUNDS);
-    const id = uuidv4();
-    await dbRun('INSERT INTO users (id, email, password_hash, first_name, last_name) VALUES (?, ?, ?, ?, ?)', [id, email, hash, firstName, lastName]);
-    res.json({ success: true, id });
-  } catch (err) {
-    console.error('Register error', err && err.stack ? err.stack : err);
-    res.status(500).json({ error: 'Registration failed' });
-  }
+app.post('/api/auth/register', async (req, res) => {
+    try {
+        const schema = Joi.object({
+            email: Joi.string().email().required(),
+            password: Joi.string().min(6).required(),
+            firstName: Joi.string().min(1).required(),
+            lastName: Joi.string().min(1).required(),
+            deviceId: Joi.string().required(),
+            deviceName: Joi.string().required(),
+            deviceType: Joi.string().valid('MOBILE', 'WEB', 'DESKTOP').required()
+        });
+        
+        const { error, value } = schema.validate(req.body);
+        if (error) {
+            return res.status(400).json({ success: false, error: error.details[0].message });
+        }
+        
+        const { email, password, firstName, lastName, deviceId, deviceName, deviceType } = value;
+        
+        // Check if user already exists
+        const existingUser = await dbGet('SELECT id FROM users WHERE email = ?', [email]);
+        if (existingUser) {
+            return res.status(409).json({ success: false, error: 'User already exists with this email' });
+        }
+        
+        // Hash password
+        const saltRounds = parseInt(process.env.BCRYPT_ROUNDS) || 12;
+        const passwordHash = await bcrypt.hash(password, saltRounds);
+        
+        // Create user
+        const userId = uuidv4();
+        await dbRun(
+            'INSERT INTO users (id, email, password_hash, first_name, last_name) VALUES (?, ?, ?, ?, ?)',
+            [userId, email, passwordHash, firstName, lastName]
+        );
+        
+        // Generate tokens
+        const sessionId = uuidv4();
+        const tokenPayload = { userId, sessionId, email };
+        const accessToken = jwt.sign(tokenPayload, process.env.JWT_SECRET || 'fallback_secret', {
+            expiresIn: process.env.JWT_EXPIRES_IN || '7d'
+        });
+        const refreshToken = jwt.sign(
+            { ...tokenPayload, type: 'refresh' },
+            process.env.JWT_SECRET || 'fallback_secret',
+            { expiresIn: '30d' }
+        );
+        
+        // Store session
+        const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+        await dbRun(
+            `INSERT INTO user_sessions (id, user_id, device_id, device_name, device_type, 
+             access_token_hash, refresh_token_hash, expires_at) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            [sessionId, userId, deviceId, deviceName, deviceType,
+             await bcrypt.hash(accessToken, 5), await bcrypt.hash(refreshToken, 5), expiresAt]
+        );
+        
+        res.status(201).json({
+            success: true,
+            message: 'User registered successfully',
+            user: { id: userId, email, firstName, lastName },
+            tokens: { accessToken, refreshToken, expiresIn: '7d' },
+            sessionId
+        });
+        
+    } catch (error) {
+        console.error('Registration error:', error);
+        res.status(500).json({ success: false, error: 'Registration failed' });
+    }
 });
 
 // Login
-app.post('/api/login', async (req, res) => {
-  try {
-    const { email, password } = req.body;
-    if (!email || !password) return res.status(400).json({ error: 'Missing email or password' });
-    const user = await dbGet('SELECT * FROM users WHERE email = ?', [email]);
-    if (!user) return res.status(400).json({ error: 'Invalid credentials' });
-    const match = await bcrypt.compare(password, user.password_hash);
-    if (!match) return res.status(400).json({ error: 'Invalid credentials' });
-    const token = generateToken(user);
-    res.json({ token });
-  } catch (err) {
-    console.error('Login error', err && err.stack ? err.stack : err);
-    res.status(500).json({ error: 'Login failed' });
-  }
+app.post('/api/auth/login', async (req, res) => {
+    try {
+        const schema = Joi.object({
+            email: Joi.string().email().required(),
+            password: Joi.string().required(),
+            deviceId: Joi.string().required(),
+            deviceName: Joi.string().required(),
+            deviceType: Joi.string().valid('MOBILE', 'WEB', 'DESKTOP').required()
+        });
+        
+        const { error, value } = schema.validate(req.body);
+        if (error) {
+            return res.status(400).json({ success: false, error: error.details[0].message });
+        }
+        
+        const { email, password, deviceId, deviceName, deviceType } = value;
+        
+        // Find user
+        const user = await dbGet('SELECT * FROM users WHERE email = ?', [email]);
+        if (!user) {
+            return res.status(401).json({ success: false, error: 'Invalid email or password' });
+        }
+        
+        // Verify password (skip for OAuth users)
+        if (user.password_hash !== 'google_oauth') {
+            const isValid = await bcrypt.compare(password, user.password_hash);
+            if (!isValid) {
+                return res.status(401).json({ success: false, error: 'Invalid email or password' });
+            }
+        } else {
+            return res.status(401).json({ success: false, error: 'Please use Google OAuth to login' });
+        }
+        
+        // Generate tokens
+        const sessionId = uuidv4();
+        const tokenPayload = { userId: user.id, sessionId, email };
+        const accessToken = jwt.sign(tokenPayload, process.env.JWT_SECRET || 'fallback_secret', {
+            expiresIn: process.env.JWT_EXPIRES_IN || '7d'
+        });
+        const refreshToken = jwt.sign(
+            { ...tokenPayload, type: 'refresh' },
+            process.env.JWT_SECRET || 'fallback_secret',
+            { expiresIn: '30d' }
+        );
+        
+        // Store session
+        const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+        await dbRun(
+            `INSERT INTO user_sessions (id, user_id, device_id, device_name, device_type, 
+             access_token_hash, refresh_token_hash, expires_at) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            [sessionId, user.id, deviceId, deviceName, deviceType,
+             await bcrypt.hash(accessToken, 5), await bcrypt.hash(refreshToken, 5), expiresAt]
+        );
+        
+        res.json({
+            success: true,
+            message: 'Login successful',
+            user: {
+                id: user.id,
+                email: user.email,
+                firstName: user.first_name,
+                lastName: user.last_name
+            },
+            tokens: { accessToken, refreshToken, expiresIn: '7d' },
+            sessionId
+        });
+        
+    } catch (error) {
+        console.error('Login error:', error);
+        res.status(500).json({ success: false, error: 'Login failed' });
+    }
 });
 
-// Upload file
+// =============================================================================
+// 📁 FILE UPLOAD ENDPOINTS
+// =============================================================================
+
 app.post('/api/upload', authMiddleware, upload.single('file'), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
-    const { originalname, filename, mimetype, size, path: filePath } = req.file;
-    const fileId = uuidv4();
-    await dbRun(
-      `INSERT INTO files (id, user_id, filename, original_name, file_path, file_size, mime_type)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [fileId, req.user.id, filename, originalname, filePath, size, mimetype]
-    );
-    res.json({ success: true, fileId });
-  } catch (err) {
-    console.error('Upload error', err && err.stack ? err.stack : err);
-    res.status(500).json({ error: 'Upload failed' });
-  }
+    try {
+        if (!req.file) {
+            return res.status(400).json({ success: false, error: 'No file uploaded' });
+        }
+        
+        const fileId = uuidv4();
+        const { filename, originalname, path: filePath, size, mimetype } = req.file;
+        
+        await dbRun(
+            `INSERT INTO files (id, user_id, filename, original_name, file_path, file_size, mime_type) 
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [fileId, req.user.id, filename, originalname, filePath, size, mimetype]
+        );
+        
+        res.json({
+            success: true,
+            message: 'File uploaded successfully',
+            file: {
+                id: fileId,
+                filename,
+                originalName: originalname,
+                size,
+                mimeType: mimetype,
+                uploadedAt: new Date().toISOString()
+            }
+        });
+        
+    } catch (error) {
+        console.error('Upload error:', error);
+        res.status(500).json({ success: false, error: 'Upload failed' });
+    }
 });
 
-// List files
+// Get user files
 app.get('/api/files', authMiddleware, async (req, res) => {
-  try {
-    const files = await dbAll('SELECT * FROM files WHERE user_id = ? ORDER BY uploaded_at DESC', [req.user.id]);
-    res.json({ files });
-  } catch (err) {
-    console.error('List files error', err && err.stack ? err.stack : err);
-    res.status(500).json({ error: 'Could not list files' });
-  }
+    try {
+        const files = await dbAll('SELECT * FROM files WHERE user_id = ? ORDER BY uploaded_at DESC', [req.user.id]);
+        
+        res.json({
+            success: true,
+            files: files.map(file => ({
+                id: file.id,
+                filename: file.filename,
+                originalName: file.original_name,
+                size: file.file_size,
+                mimeType: file.mime_type,
+                uploadedAt: file.uploaded_at
+            }))
+        });
+        
+    } catch (error) {
+        console.error('Get files error:', error);
+        res.status(500).json({ success: false, error: 'Failed to fetch files' });
+    }
 });
 
-// Download file
-app.get('/api/files/:id/download', authMiddleware, async (req, res) => {
-  try {
-    const fileId = req.params.id;
-    const fileRow = await dbGet('SELECT * FROM files WHERE id = ?', [fileId]);
-    if (!fileRow) return res.status(404).json({ error: 'File not found' });
-    if (fileRow.user_id !== req.user.id) return res.status(403).json({ error: 'Access denied' });
-    const absPath = path.resolve(fileRow.file_path);
-    if (!absPath.startsWith(uploadsDir)) return res.status(400).json({ error: 'Invalid file path' });
-    if (!fs.existsSync(absPath)) return res.status(404).json({ error: 'File not found on disk' });
-    res.setHeader('Content-Type', fileRow.mime_type || 'application/octet-stream');
-    res.setHeader('Content-Disposition', `attachment; filename="${fileRow.original_name || fileRow.filename}"`);
-    fs.createReadStream(absPath).pipe(res);
-  } catch (err) {
-    console.error('Download error', err && err.stack ? err.stack : err);
-    res.status(500).json({ error: 'Download failed' });
-  }
-});
+// =============================================================================
+// 🏥 HEALTH CHECK
+// =============================================================================
 
-// Health check
 app.get('/health', (req, res) => {
-  res.json({
-    status: 'healthy',
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
-    environment: NODE_ENV
-  });
+    res.json({
+        status: 'healthy',
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime(),
+        environment: process.env.NODE_ENV || 'development'
+    });
 });
 
-// --------- START (decide DB, configure session, init DB, start server) ---------
-(async function start() {
-  try {
-    // Attempt Postgres if env vars exist
-    if ((process.env.DATABASE_URL && process.env.DATABASE_URL.startsWith('postgresql://')) ||
-        (process.env.DATABASE_PUBLIC_URL && process.env.DATABASE_PUBLIC_URL.startsWith('postgresql://'))) {
-      try {
-        pool = await createPostgresPoolOrThrow();
-        isPostgres = true;
+// =============================================================================
+// 🚀 START SERVER
+// =============================================================================
 
-        // wire db helpers to pool
-        dbRun = async (query, params = []) => {
-          const { text, values } = convertPlaceholders(query, params);
-          const client = await pool.connect();
-          try { return await client.query(text, values); }
-          finally { client.release(); }
-        };
+const PORT = process.env.PORT || 3000;
 
-        dbGet = async (query, params = []) => {
-          const { text, values } = convertPlaceholders(query, params);
-          const client = await pool.connect();
-          try {
-            const result = await client.query(text, values);
-            return result.rows[0];
-          } finally { client.release(); }
-        };
-
-        dbAll = async (query, params = []) => {
-          const { text, values } = convertPlaceholders(query, params);
-          const client = await pool.connect();
-          try {
-            const result = await client.query(text, values);
-            return result.rows;
-          } finally { client.release(); }
-        };
-
-      } catch (err) {
-        console.error('❌ Could not connect to Postgres (both internal and public attempts failed). Falling back to SQLite if available. Error:', err && err.stack ? err.stack : err);
-        // fall through to sqlite below if desired
-      }
+const startServer = async () => {
+    try {
+        await initDatabase();
+        
+        app.listen(PORT, () => {
+            console.log(`🚀 Cloud Backup Server running on port ${PORT}`);
+            console.log(`🔗 Health check: http://localhost:${PORT}/health`);
+            console.log(`🔐 Google OAuth: http://localhost:${PORT}/auth/google`);
+            console.log(`📋 Environment: ${process.env.NODE_ENV || 'development'}`);
+        });
+    } catch (error) {
+        console.error('❌ Failed to start server:', error);
+        process.exit(1);
     }
+};
 
-    // If we didn't set dbRun/dbGet/dbAll from Postgres, set up sqlite fallback
-    if (!dbRun || !dbGet || !dbAll) {
-      // sqlite fallback
-      const Database = require('sqlite3').Database;
-      const dbPath = './cloudbackup.db';
-      const sqliteDb = new Database(dbPath);
-
-      dbRun = (query, params = []) => new Promise((resolve, reject) => {
-        sqliteDb.run(query, params, function(err) {
-          if (err) reject(err);
-          else resolve({ changes: this.changes, lastID: this.lastID });
-        });
-      });
-
-      dbGet = (query, params = []) => new Promise((resolve, reject) => {
-        sqliteDb.get(query, params, (err, row) => {
-          if (err) reject(err);
-          else resolve(row);
-        });
-      });
-
-      dbAll = (query, params = []) => new Promise((resolve, reject) => {
-        sqliteDb.all(query, params, (err, rows) => {
-          if (err) reject(err);
-          else resolve(rows);
-        });
-      });
-
-      console.log('⚠️ Using SQLite fallback (local development).');
-    }
-
-    // Configure session store now that we have either pool or not
-    configureSession(app, pool);
-
-    // Initialize DB (create tables)
-    await initDatabase();
-
-    // Start server
-    app.listen(PORT, () => {
-      console.log(`🚀 Server running on port ${PORT} in ${NODE_ENV} mode`);
-      console.log(`🔗 Health check: http://localhost:${PORT}/health (or your deployed host)`);
-    });
-
-  } catch (err) {
-    console.error('❌ Failed to start server:', err && err.stack ? err.stack : err);
-    process.exit(1);
-  }
-})();
+startServer();
