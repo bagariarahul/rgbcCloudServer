@@ -69,6 +69,10 @@ logger.info('📋 Configuration loaded', {
 
 const app = express();
 
+// CRITICAL: Trust proxy for Railway deployment
+// Railway uses proxies, so we need to trust the X-Forwarded-For header
+app.set('trust proxy', true);
+
 // Security middleware
 app.use(helmet({
   contentSecurityPolicy: false, // Disable for development
@@ -97,13 +101,14 @@ app.use(morgan('combined', {
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-// Rate limiting
+// Rate limiting - UPDATED for Railway proxy
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: NODE_ENV === 'production' ? 200 : 1000,
   message: { success: false, error: 'Too many requests, please try again later.' },
   standardHeaders: true,
   legacyHeaders: false,
+  trustProxy: true, // Trust Railway's proxy
 });
 
 app.use('/api', limiter); // Only apply to API routes
@@ -658,6 +663,8 @@ app.get('/', (req, res) => {
       auth: {
         register: 'POST /api/register',
         login: 'POST /api/login',
+        authRegister: 'POST /api/auth/register',
+        authLogin: 'POST /api/auth/login',
         googleOAuth: process.env.GOOGLE_CLIENT_ID ? '/auth/google' : 'Not configured'
       },
       files: {
@@ -668,6 +675,284 @@ app.get('/', (req, res) => {
     }
   });
 });
+
+// =============================================================================
+// 🔗 AUTHENTICATION ROUTES (Both /api and /api/auth for compatibility)
+// =============================================================================
+
+// Original routes
+app.post('/api/register', asyncHandler(async (req, res) => {
+  const schema = Joi.object({
+    email: Joi.string().email().required(),
+    password: Joi.string().min(6).required(),
+    firstName: Joi.string().min(1).max(100).optional(),
+    lastName: Joi.string().min(1).max(100).optional()
+  });
+
+  const { error, value } = schema.validate(req.body);
+  if (error) {
+    return res.status(400).json({ success: false, error: error.details[0].message });
+  }
+
+  const { email, password, firstName, lastName } = value;
+
+  const existingUser = await dbGet('SELECT id FROM users WHERE email = ?', [email]);
+  if (existingUser) {
+    return res.status(409).json({ success: false, error: 'User with this email already exists' });
+  }
+
+  const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+  const userId = uuidv4();
+
+  await dbRun(
+    'INSERT INTO users (id, email, password_hash, first_name, last_name) VALUES (?, ?, ?, ?, ?)',
+    [userId, email, passwordHash, firstName || null, lastName || null]
+  );
+
+  logger.info('👤 User registered successfully', { userId, email });
+
+  res.status(201).json({
+    success: true,
+    message: 'User registered successfully',
+    user: { id: userId, email }
+  });
+}));
+
+app.post('/api/login', asyncHandler(async (req, res) => {
+  const schema = Joi.object({
+    email: Joi.string().email().required(),
+    password: Joi.string().required()
+  });
+
+  const { error, value } = schema.validate(req.body);
+  if (error) {
+    return res.status(400).json({ success: false, error: error.details[0].message });
+  }
+
+  const { email, password } = value;
+
+  const user = await dbGet('SELECT * FROM users WHERE email = ?', [email]);
+  if (!user) {
+    return res.status(401).json({ success: false, error: 'Invalid email or password' });
+  }
+
+  if (user.password_hash === 'google_oauth') {
+    return res.status(401).json({ success: false, error: 'Please use Google OAuth to login' });
+  }
+
+  const isValidPassword = await bcrypt.compare(password, user.password_hash);
+  if (!isValidPassword) {
+    return res.status(401).json({ success: false, error: 'Invalid email or password' });
+  }
+
+  const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '7d' });
+
+  logger.info('🔐 User logged in successfully', { userId: user.id, email });
+
+  res.status(200).json({
+    success: true,
+    token,
+    user: {
+      id: user.id,
+      email: user.email,
+      firstName: user.first_name,
+      lastName: user.last_name
+    },
+    message: 'Login successful'
+  });
+}));
+
+// Android app compatibility routes (/api/auth/*)
+app.post('/api/auth/register', asyncHandler(async (req, res) => {
+  const schema = Joi.object({
+    email: Joi.string().email().required(),
+    password: Joi.string().min(6).required(),
+    firstName: Joi.string().min(1).max(100).optional(),
+    lastName: Joi.string().min(1).max(100).optional()
+  });
+
+  const { error, value } = schema.validate(req.body);
+  if (error) {
+    return res.status(400).json({ success: false, error: error.details[0].message });
+  }
+
+  const { email, password, firstName, lastName } = value;
+
+  const existingUser = await dbGet('SELECT id FROM users WHERE email = ?', [email]);
+  if (existingUser) {
+    return res.status(409).json({ success: false, error: 'User with this email already exists' });
+  }
+
+  const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+  const userId = uuidv4();
+
+  await dbRun(
+    'INSERT INTO users (id, email, password_hash, first_name, last_name) VALUES (?, ?, ?, ?, ?)',
+    [userId, email, passwordHash, firstName || null, lastName || null]
+  );
+
+  logger.info('👤 User registered successfully via /auth/register', { userId, email });
+
+  res.status(201).json({
+    success: true,
+    message: 'User registered successfully',
+    user: { id: userId, email }
+  });
+}));
+
+app.post('/api/auth/login', asyncHandler(async (req, res) => {
+  const schema = Joi.object({
+    email: Joi.string().email().required(),
+    password: Joi.string().required()
+  });
+
+  const { error, value } = schema.validate(req.body);
+  if (error) {
+    return res.status(400).json({ success: false, error: error.details[0].message });
+  }
+
+  const { email, password } = value;
+
+  const user = await dbGet('SELECT * FROM users WHERE email = ?', [email]);
+  if (!user) {
+    return res.status(401).json({ success: false, error: 'Invalid email or password' });
+  }
+
+  if (user.password_hash === 'google_oauth') {
+    return res.status(401).json({ success: false, error: 'Please use Google OAuth to login' });
+  }
+
+  const isValidPassword = await bcrypt.compare(password, user.password_hash);
+  if (!isValidPassword) {
+    return res.status(401).json({ success: false, error: 'Invalid email or password' });
+  }
+
+  const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '7d' });
+
+  logger.info('🔐 User logged in successfully via /auth/login', { userId: user.id, email });
+
+  res.status(200).json({
+    success: true,
+    token,
+    user: {
+      id: user.id,
+      email: user.email,
+      firstName: user.first_name,
+      lastName: user.last_name
+    },
+    message: 'Login successful'
+  });
+}));
+
+// Additional auth endpoints for compatibility
+app.post('/api/auth/logout', asyncHandler(async (req, res) => {
+  // For JWT tokens, logout is typically handled client-side
+  // But we can provide this endpoint for compatibility
+  res.status(200).json({
+    success: true,
+    message: 'Logout successful'
+  });
+}));
+
+app.get('/api/auth/me', authMiddleware, asyncHandler(async (req, res) => {
+  const user = await dbGet('SELECT id, email, first_name, last_name FROM users WHERE id = ?', [req.user.id]);
+  
+  if (!user) {
+    return res.status(404).json({ success: false, error: 'User not found' });
+  }
+
+  res.status(200).json({
+    success: true,
+    user: {
+      id: user.id,
+      email: user.email,
+      firstName: user.first_name,
+      lastName: user.last_name
+    }
+  });
+}));
+
+// =============================================================================
+// 📁 FILE ROUTES
+// =============================================================================
+
+// File upload
+app.post('/api/upload', authMiddleware, upload.single('file'), asyncHandler(async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ success: false, error: 'No file was uploaded' });
+  }
+
+  const { filename, originalname, path: filePath, size, mimetype } = req.file;
+  const fileId = uuidv4();
+
+  await dbRun(
+    'INSERT INTO files (id, user_id, filename, original_name, file_path, file_size, mime_type) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    [fileId, req.user.id, filename, originalname, filePath, size, mimetype]
+  );
+
+  logger.info('📁 File uploaded successfully', {
+    userId: req.user.id,
+    fileId,
+    originalname,
+    size: `${Math.round(size / 1024)}KB`
+  });
+
+  res.status(201).json({
+    success: true,
+    fileId,
+    filename: originalname,
+    size,
+    message: 'File uploaded successfully'
+  });
+}));
+
+// Get user files
+app.get('/api/files', authMiddleware, asyncHandler(async (req, res) => {
+  const files = await dbAll(
+    'SELECT id, original_name, file_size, mime_type, uploaded_at FROM files WHERE user_id = ? ORDER BY uploaded_at DESC',
+    [req.user.id]
+  );
+
+  res.status(200).json({
+    success: true,
+    files: files.map(file => ({
+      id: file.id,
+      name: file.original_name,
+      size: file.file_size,
+      type: file.mime_type,
+      uploadedAt: file.uploaded_at
+    })),
+    count: files.length
+  });
+}));
+
+// Download file
+app.get('/api/files/:id/download', authMiddleware, asyncHandler(async (req, res) => {
+  const { id } = req.params;
+
+  const file = await dbGet('SELECT * FROM files WHERE id = ? AND user_id = ?', [id, req.user.id]);
+  if (!file) {
+    return res.status(404).json({ success: false, error: 'File not found or access denied' });
+  }
+
+  const absolutePath = path.resolve(file.file_path);
+  if (!fs.existsSync(absolutePath)) {
+    logger.error('❌ File missing from disk', { fileId: id, path: absolutePath });
+    return res.status(404).json({ success: false, error: 'File not found on server' });
+  }
+
+  logger.info('⬇️ File download requested', { userId: req.user.id, fileId: id });
+
+  res.download(absolutePath, file.original_name, (err) => {
+    if (err) {
+      logger.error('❌ File download error', { error: err.message, fileId: id });
+    }
+  });
+}));
+
+// =============================================================================
+// 🔍 ADDITIONAL ENDPOINTS
+// =============================================================================
 
 // Metrics endpoint for monitoring
 app.get('/metrics', asyncHandler(async (req, res) => {
@@ -759,163 +1044,6 @@ if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
     }
   });
 }
-
-// User registration
-app.post('/api/register', asyncHandler(async (req, res) => {
-  const schema = Joi.object({
-    email: Joi.string().email().required(),
-    password: Joi.string().min(6).required(),
-    firstName: Joi.string().min(1).max(100).optional(),
-    lastName: Joi.string().min(1).max(100).optional()
-  });
-
-  const { error, value } = schema.validate(req.body);
-  if (error) {
-    return res.status(400).json({ success: false, error: error.details[0].message });
-  }
-
-  const { email, password, firstName, lastName } = value;
-
-  const existingUser = await dbGet('SELECT id FROM users WHERE email = ?', [email]);
-  if (existingUser) {
-    return res.status(409).json({ success: false, error: 'User with this email already exists' });
-  }
-
-  const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
-  const userId = uuidv4();
-
-  await dbRun(
-    'INSERT INTO users (id, email, password_hash, first_name, last_name) VALUES (?, ?, ?, ?, ?)',
-    [userId, email, passwordHash, firstName || null, lastName || null]
-  );
-
-  logger.info('👤 User registered successfully', { userId, email });
-
-  res.status(201).json({
-    success: true,
-    message: 'User registered successfully',
-    user: { id: userId, email }
-  });
-}));
-
-// User login
-app.post('/api/login', asyncHandler(async (req, res) => {
-  const schema = Joi.object({
-    email: Joi.string().email().required(),
-    password: Joi.string().required()
-  });
-
-  const { error, value } = schema.validate(req.body);
-  if (error) {
-    return res.status(400).json({ success: false, error: error.details[0].message });
-  }
-
-  const { email, password } = value;
-
-  const user = await dbGet('SELECT * FROM users WHERE email = ?', [email]);
-  if (!user) {
-    return res.status(401).json({ success: false, error: 'Invalid email or password' });
-  }
-
-  if (user.password_hash === 'google_oauth') {
-    return res.status(401).json({ success: false, error: 'Please use Google OAuth to login' });
-  }
-
-  const isValidPassword = await bcrypt.compare(password, user.password_hash);
-  if (!isValidPassword) {
-    return res.status(401).json({ success: false, error: 'Invalid email or password' });
-  }
-
-  const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '7d' });
-
-  logger.info('🔐 User logged in successfully', { userId: user.id, email });
-
-  res.status(200).json({
-    success: true,
-    token,
-    user: {
-      id: user.id,
-      email: user.email,
-      firstName: user.first_name,
-      lastName: user.last_name
-    },
-    message: 'Login successful'
-  });
-}));
-
-// File upload
-app.post('/api/upload', authMiddleware, upload.single('file'), asyncHandler(async (req, res) => {
-  if (!req.file) {
-    return res.status(400).json({ success: false, error: 'No file was uploaded' });
-  }
-
-  const { filename, originalname, path: filePath, size, mimetype } = req.file;
-  const fileId = uuidv4();
-
-  await dbRun(
-    'INSERT INTO files (id, user_id, filename, original_name, file_path, file_size, mime_type) VALUES (?, ?, ?, ?, ?, ?, ?)',
-    [fileId, req.user.id, filename, originalname, filePath, size, mimetype]
-  );
-
-  logger.info('📁 File uploaded successfully', {
-    userId: req.user.id,
-    fileId,
-    originalname,
-    size: `${Math.round(size / 1024)}KB`
-  });
-
-  res.status(201).json({
-    success: true,
-    fileId,
-    filename: originalname,
-    size,
-    message: 'File uploaded successfully'
-  });
-}));
-
-// Get user files
-app.get('/api/files', authMiddleware, asyncHandler(async (req, res) => {
-  const files = await dbAll(
-    'SELECT id, original_name, file_size, mime_type, uploaded_at FROM files WHERE user_id = ? ORDER BY uploaded_at DESC',
-    [req.user.id]
-  );
-
-  res.status(200).json({
-    success: true,
-    files: files.map(file => ({
-      id: file.id,
-      name: file.original_name,
-      size: file.file_size,
-      type: file.mime_type,
-      uploadedAt: file.uploaded_at
-    })),
-    count: files.length
-  });
-}));
-
-// Download file
-app.get('/api/files/:id/download', authMiddleware, asyncHandler(async (req, res) => {
-  const { id } = req.params;
-
-  const file = await dbGet('SELECT * FROM files WHERE id = ? AND user_id = ?', [id, req.user.id]);
-  if (!file) {
-    return res.status(404).json({ success: false, error: 'File not found or access denied' });
-  }
-
-  const absolutePath = path.resolve(file.file_path);
-  if (!fs.existsSync(absolutePath)) {
-    logger.error('❌ File missing from disk', { fileId: id, path: absolutePath });
-    return res.status(404).json({ success: false, error: 'File not found on server' });
-  }
-
-  logger.info('⬇️ File download requested', { userId: req.user.id, fileId: id });
-
-  res.download(absolutePath, file.original_name, (err) => {
-    if (err) {
-      logger.error('❌ File download error', { error: err.message, fileId: id });
-    }
-  });
-}));
 
 // =============================================================================
 // 💣 ERROR HANDLING
