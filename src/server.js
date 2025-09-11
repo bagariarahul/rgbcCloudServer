@@ -70,6 +70,16 @@ if (connStr && connStr.startsWith('postgresql://')) {
     ssl: { rejectUnauthorized: false }
   });
 
+    try {
+    const client = await pool.connect();
+    client.release();
+    console.log('✅ Postgres connection established (using connection string from env).');
+  } catch (err) {
+    console.error('❌ Postgres connection test failed:', err);
+    // don't silently continue — fail startup so we see it in logs
+    throw err;
+  }
+
  pool.connect()
     .then(client => {
       client.release();
