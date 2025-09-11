@@ -46,47 +46,58 @@ logger.info('🚀 Starting Cloud Backup Server...');
 // =============================================================================
 const PORT = process.env.PORT || 3000;
 const NODE_ENV = process.env.NODE_ENV || 'development';
-const DATABASE_URL = process.env.DATABASE_URL;
+const DATABASE_URL = process.env.DATABASE_PUBLIC_URL || process.env.DATABASE_URL; // Use PUBLIC_URL for Railway
 const SESSION_SECRET = process.env.SESSION_SECRET || 'dev-session-secret-change-in-production';
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-jwt-secret-change-in-production';
 const UPLOADS_DIR = process.env.UPLOAD_PATH || './uploads';
 const BCRYPT_ROUNDS = parseInt(process.env.BCRYPT_ROUNDS, 10) || 12;
 
+logger.info('📋 Configuration loaded', {
+    port: PORT,
+    environment: NODE_ENV,
+    hasDatabase: !!DATABASE_URL,
+    hasGoogleOAuth: !!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET)
+});
+
 // =============================================================================
-// 🗄️ DATABASE SETUP & CONNECTION
+// 🗄️ DATABASE SETUP & CONNECTION - RAILWAY OPTIMIZED
 // =============================================================================
 let pool;
 let dbRun, dbGet, dbAll, closeDatabaseConnection;
 
 if (DATABASE_URL && DATABASE_URL.startsWith('postgresql://')) {
-    logger.info('🐘 Initializing PostgreSQL connection...');
+    logger.info('🐘 Initializing PostgreSQL connection for Railway...');
     const { Pool } = require('pg');
     
-    // Enhanced SSL configuration for production deployments
-    const sslConfig = NODE_ENV === 'production' ? {
-        ssl: {
-            rejectUnauthorized: false,
-            require: true
-        }
-    } : {};
+    // Railway-specific SSL configuration
+    const isRailway = DATABASE_URL.includes('railway.app') || DATABASE_URL.includes('rlwy.net');
     
-    pool = new Pool({
+    let poolConfig = {
         connectionString: DATABASE_URL,
-        ...sslConfig,
-        max: 20,
-        idleTimeoutMillis: 30000,
-        connectionTimeoutMillis: 10000,
-    });
+        max: 10, // Reduced for Railway limits
+        idleTimeoutMillis: 20000,
+        connectionTimeoutMillis: 15000,
+        acquireTimeoutMillis: 15000,
+        allowExitOnIdle: true
+    };
+
+    // SSL configuration for Railway
+    if (isRailway || NODE_ENV === 'production') {
+        poolConfig.ssl = {
+            rejectUnauthorized: false
+        };
+    }
+    
+    pool = new Pool(poolConfig);
 
     pool.on('connect', (client) => {
         logger.info('✅ Database pool connected successfully');
     });
 
     pool.on('error', (err, client) => {
-        logger.error('❌ Unexpected database pool error', { 
+        logger.error('❌ Database pool error', { 
             error: err.message, 
-            code: err.code,
-            stack: err.stack 
+            code: err.code
         });
     });
 
@@ -96,54 +107,70 @@ if (DATABASE_URL && DATABASE_URL.startsWith('postgresql://')) {
         return query.replace(/\?/g, () => `$${++i}`);
     };
 
-    dbRun = async (query, params = []) => {
-        const client = await pool.connect();
-        try {
-            logger.debug('🔍 Executing DB run query', { query: query.substring(0, 100) + '...', paramCount: params.length });
-            const result = await client.query(convertPlaceholders(query), params);
-            return result;
-        } catch (error) {
-            logger.error('❌ Database run query failed', { 
-                error: error.message, 
-                query: query.substring(0, 100) + '...' 
-            });
-            throw error;
-        } finally {
-            client.release();
+    // Enhanced database functions with retry logic
+    dbRun = async (query, params = [], retries = 3) => {
+        for (let attempt = 1; attempt <= retries; attempt++) {
+            let client;
+            try {
+                client = await pool.connect();
+                const result = await client.query(convertPlaceholders(query), params);
+                return result;
+            } catch (error) {
+                logger.error(`❌ Database run query failed (attempt ${attempt}/${retries})`, { 
+                    error: error.message, 
+                    code: error.code,
+                    query: query.substring(0, 50) + '...'
+                });
+                
+                if (attempt === retries) throw error;
+                await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+            } finally {
+                if (client) client.release();
+            }
         }
     };
 
-    dbGet = async (query, params = []) => {
-        const client = await pool.connect();
-        try {
-            logger.debug('🔍 Executing DB get query', { query: query.substring(0, 100) + '...', paramCount: params.length });
-            const result = await client.query(convertPlaceholders(query), params);
-            return result.rows[0];
-        } catch (error) {
-            logger.error('❌ Database get query failed', { 
-                error: error.message, 
-                query: query.substring(0, 100) + '...' 
-            });
-            throw error;
-        } finally {
-            client.release();
+    dbGet = async (query, params = [], retries = 3) => {
+        for (let attempt = 1; attempt <= retries; attempt++) {
+            let client;
+            try {
+                client = await pool.connect();
+                const result = await client.query(convertPlaceholders(query), params);
+                return result.rows[0];
+            } catch (error) {
+                logger.error(`❌ Database get query failed (attempt ${attempt}/${retries})`, { 
+                    error: error.message, 
+                    code: error.code,
+                    query: query.substring(0, 50) + '...'
+                });
+                
+                if (attempt === retries) throw error;
+                await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+            } finally {
+                if (client) client.release();
+            }
         }
     };
 
-    dbAll = async (query, params = []) => {
-        const client = await pool.connect();
-        try {
-            logger.debug('🔍 Executing DB all query', { query: query.substring(0, 100) + '...', paramCount: params.length });
-            const result = await client.query(convertPlaceholders(query), params);
-            return result.rows;
-        } catch (error) {
-            logger.error('❌ Database all query failed', { 
-                error: error.message, 
-                query: query.substring(0, 100) + '...' 
-            });
-            throw error;
-        } finally {
-            client.release();
+    dbAll = async (query, params = [], retries = 3) => {
+        for (let attempt = 1; attempt <= retries; attempt++) {
+            let client;
+            try {
+                client = await pool.connect();
+                const result = await client.query(convertPlaceholders(query), params);
+                return result.rows;
+            } catch (error) {
+                logger.error(`❌ Database all query failed (attempt ${attempt}/${retries})`, { 
+                    error: error.message, 
+                    code: error.code,
+                    query: query.substring(0, 50) + '...'
+                });
+                
+                if (attempt === retries) throw error;
+                await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+            } finally {
+                if (client) client.release();
+            }
         }
     };
 
@@ -165,7 +192,7 @@ if (DATABASE_URL && DATABASE_URL.startsWith('postgresql://')) {
     dbRun = (query, params = []) => new Promise((resolve, reject) => {
         db.run(query, params, function (err) {
             if (err) {
-                logger.error('❌ SQLite run query failed', { error: err.message, query: query.substring(0, 100) + '...' });
+                logger.error('❌ SQLite run query failed', { error: err.message });
                 reject(err);
             } else {
                 resolve({ changes: this.changes, lastID: this.lastID });
@@ -176,7 +203,7 @@ if (DATABASE_URL && DATABASE_URL.startsWith('postgresql://')) {
     dbGet = (query, params = []) => new Promise((resolve, reject) => {
         db.get(query, params, (err, row) => {
             if (err) {
-                logger.error('❌ SQLite get query failed', { error: err.message, query: query.substring(0, 100) + '...' });
+                logger.error('❌ SQLite get query failed', { error: err.message });
                 reject(err);
             } else {
                 resolve(row);
@@ -187,7 +214,7 @@ if (DATABASE_URL && DATABASE_URL.startsWith('postgresql://')) {
     dbAll = (query, params = []) => new Promise((resolve, reject) => {
         db.all(query, params, (err, rows) => {
             if (err) {
-                logger.error('❌ SQLite all query failed', { error: err.message, query: query.substring(0, 100) + '...' });
+                logger.error('❌ SQLite all query failed', { error: err.message });
                 reject(err);
             } else {
                 resolve(rows);
@@ -209,36 +236,27 @@ if (DATABASE_URL && DATABASE_URL.startsWith('postgresql://')) {
 }
 
 // =============================================================================
-// 🗄️ DATABASE INITIALIZATION
+// 🗄️ DATABASE INITIALIZATION - SIMPLIFIED FOR RAILWAY
 // =============================================================================
 const initDatabase = async () => {
     try {
-        logger.info('🔧 Initializing database schema...');
+        logger.info('🔧 Testing database connection...');
         
-        // Test connection first
-        await dbGet('SELECT NOW() as current_time');
+        // Simple connection test without complex queries
+        await dbGet('SELECT 1 as test');
         logger.info('✅ Database connection test successful');
 
+        logger.info('🔧 Creating database tables...');
+
         // Create users table
-        const usersTable = NODE_ENV === 'production' ? `
+        const usersTable = `
             CREATE TABLE IF NOT EXISTS users (
                 id VARCHAR(36) PRIMARY KEY,
                 email VARCHAR(255) UNIQUE NOT NULL,
                 password_hash TEXT NOT NULL,
                 first_name VARCHAR(100),
                 last_name VARCHAR(100),
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        ` : `
-            CREATE TABLE IF NOT EXISTS users (
-                id TEXT PRIMARY KEY,
-                email TEXT UNIQUE NOT NULL,
-                password_hash TEXT NOT NULL,
-                first_name TEXT,
-                last_name TEXT,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         `;
         
@@ -246,10 +264,10 @@ const initDatabase = async () => {
         logger.info('✅ Users table ready');
 
         // Create files table
-        const filesTable = NODE_ENV === 'production' ? `
+        const filesTable = `
             CREATE TABLE IF NOT EXISTS files (
                 id VARCHAR(36) PRIMARY KEY,
-                user_id VARCHAR(36) REFERENCES users(id) ON DELETE CASCADE,
+                user_id VARCHAR(36),
                 filename VARCHAR(255) NOT NULL,
                 original_name VARCHAR(255) NOT NULL,
                 file_path TEXT NOT NULL,
@@ -257,54 +275,17 @@ const initDatabase = async () => {
                 mime_type VARCHAR(100),
                 uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
-        ` : `
-            CREATE TABLE IF NOT EXISTS files (
-                id TEXT PRIMARY KEY,
-                user_id TEXT REFERENCES users(id) ON DELETE CASCADE,
-                filename TEXT NOT NULL,
-                original_name TEXT NOT NULL,
-                file_path TEXT NOT NULL,
-                file_size INTEGER NOT NULL,
-                mime_type TEXT,
-                uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
         `;
         
         await dbRun(filesTable);
         logger.info('✅ Files table ready');
 
-        // Create session table for PostgreSQL
-        if (NODE_ENV === 'production' && pool) {
-            const sessionTable = `
-                CREATE TABLE IF NOT EXISTS session (
-                    sid VARCHAR NOT NULL COLLATE "default",
-                    sess JSON NOT NULL,
-                    expire TIMESTAMP(6) NOT NULL
-                )
-                WITH (OIDS=FALSE);
-            `;
-            await dbRun(sessionTable);
-            
-            // Create index if it doesn't exist
-            const sessionIndex = `
-                CREATE INDEX CONCURRENTLY IF NOT EXISTS "IDX_session_expire" ON session(expire);
-            `;
-            try {
-                await dbRun(sessionIndex);
-            } catch (err) {
-                // Index might already exist, that's ok
-                logger.debug('Session index creation info', { message: err.message });
-            }
-            
-            logger.info('✅ Session table ready');
-        }
-
-        logger.info('🎉 Database schema initialization completed successfully');
+        logger.info('🎉 Database initialization completed successfully');
     } catch (error) {
         logger.error('💥 Database initialization failed', { 
             error: error.message, 
             code: error.code,
-            stack: error.stack 
+            stack: error.stack
         });
         throw error;
     }
@@ -317,44 +298,25 @@ const app = express();
 
 // Security middleware
 app.use(helmet({
-    contentSecurityPolicy: NODE_ENV === 'production' ? undefined : false
+    contentSecurityPolicy: false, // Disable for development
+    crossOriginEmbedderPolicy: false
 }));
 app.use(compression());
 
-// CORS configuration
-const corsOptions = {
-    origin: function (origin, callback) {
-        const allowedOrigins = [
-            'http://localhost:3000',
-            'http://127.0.0.1:3000',
-            process.env.FRONTEND_URL,
-            process.env.RAILWAY_STATIC_URL,
-            process.env.RENDER_EXTERNAL_URL
-        ].filter(Boolean);
-        
-        // Allow requests with no origin (mobile apps, Postman, etc.)
-        if (!origin) return callback(null, true);
-        
-        if (allowedOrigins.indexOf(origin) !== -1) {
-            callback(null, true);
-        } else {
-            logger.warn('⚠️ CORS request blocked', { origin, allowedOrigins });
-            callback(null, true); // Allow in development, you can restrict in production
-        }
-    },
+// CORS configuration - Allow all origins for now
+app.use(cors({
+    origin: true, // Allow all origins
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
-};
-
-app.use(cors(corsOptions));
+}));
 
 // Logging middleware
 app.use(morgan('combined', { 
     stream: { 
         write: message => logger.info(message.trim(), { type: 'access_log' }) 
     },
-    skip: (req, res) => req.path === '/health' // Skip health check logs
+    skip: (req, res) => req.path === '/health'
 }));
 
 // Body parsing middleware
@@ -364,29 +326,19 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 // Rate limiting
 const limiter = rateLimit({
     windowMs: 15 * 60 * 1000, // 15 minutes
-    max: NODE_ENV === 'production' ? 100 : 1000, // Limit each IP
+    max: NODE_ENV === 'production' ? 200 : 1000,
     message: { success: false, error: 'Too many requests, please try again later.' },
     standardHeaders: true,
     legacyHeaders: false,
 });
-app.use(limiter);
+app.use('/api', limiter); // Only apply to API routes
 
 // =============================================================================
 // 🔐 SESSION & PASSPORT SETUP
 // =============================================================================
-let sessionStore;
-
-if (NODE_ENV === 'production' && pool) {
-    const pgSession = require('connect-pg-simple')(session);
-    sessionStore = new pgSession({
-        pool: pool,
-        tableName: 'session'
-    });
-    logger.info('🗄️ Using PostgreSQL session store');
-} else {
-    sessionStore = new session.MemoryStore();
-    logger.warn('⚠️ Using memory session store (not recommended for production)');
-}
+// Use memory store for now to avoid session table issues
+const sessionStore = new session.MemoryStore();
+logger.info('⚠️ Using memory session store');
 
 app.use(session({
     store: sessionStore,
@@ -395,10 +347,10 @@ app.use(session({
     saveUninitialized: false,
     name: 'cloudbackup.sid',
     cookie: {
-        secure: NODE_ENV === 'production',
+        secure: false, // Allow HTTP for now
         httpOnly: true,
         maxAge: 24 * 60 * 60 * 1000, // 24 hours
-        sameSite: NODE_ENV === 'production' ? 'strict' : 'lax'
+        sameSite: 'lax'
     }
 }));
 
@@ -442,8 +394,7 @@ if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
             return done(null, user);
         } catch (error) {
             logger.error('❌ Google OAuth strategy error', { 
-                error: error.message, 
-                stack: error.stack 
+                error: error.message
             });
             return done(error, null);
         }
@@ -486,10 +437,6 @@ const upload = multer({
     limits: {
         fileSize: 100 * 1024 * 1024, // 100MB limit
         files: 1
-    },
-    fileFilter: (req, file, cb) => {
-        // Add file type restrictions if needed
-        cb(null, true);
     }
 });
 
@@ -506,7 +453,6 @@ const authMiddleware = async (req, res, next) => {
         const token = authHeader.split(' ')[1];
         const decoded = jwt.verify(token, JWT_SECRET);
         
-        // Verify user still exists
         const user = await dbGet('SELECT * FROM users WHERE id = ?', [decoded.userId]);
         if (!user) {
             return res.status(401).json({ success: false, error: 'Unauthorized: User not found' });
@@ -520,7 +466,6 @@ const authMiddleware = async (req, res, next) => {
     }
 };
 
-// Async error handler wrapper
 const asyncHandler = (fn) => (req, res, next) => {
     Promise.resolve(fn(req, res, next)).catch(next);
 };
@@ -535,7 +480,28 @@ app.get('/health', (req, res) => {
         status: 'healthy', 
         timestamp: new Date().toISOString(),
         environment: NODE_ENV,
-        uptime: process.uptime()
+        uptime: Math.floor(process.uptime())
+    });
+});
+
+// Root endpoint
+app.get('/', (req, res) => {
+    res.json({
+        message: 'Cloud Backup Server is running!',
+        version: '1.0.0',
+        endpoints: {
+            health: '/health',
+            auth: {
+                register: 'POST /api/register',
+                login: 'POST /api/login',
+                googleOAuth: '/auth/google'
+            },
+            files: {
+                upload: 'POST /api/upload',
+                list: 'GET /api/files',
+                download: 'GET /api/files/:id/download'
+            }
+        }
     });
 });
 
@@ -589,13 +555,11 @@ app.post('/api/register', asyncHandler(async (req, res) => {
 
     const { email, password, firstName, lastName } = value;
     
-    // Check if user exists
     const existingUser = await dbGet('SELECT id FROM users WHERE email = ?', [email]);
     if (existingUser) {
         return res.status(409).json({ success: false, error: 'User with this email already exists' });
     }
 
-    // Create user
     const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
     const userId = uuidv4();
     
@@ -632,7 +596,6 @@ app.post('/api/login', asyncHandler(async (req, res) => {
         return res.status(401).json({ success: false, error: 'Invalid email or password' });
     }
 
-    // Check if it's a Google OAuth user
     if (user.password_hash === 'google_oauth') {
         return res.status(401).json({ success: false, error: 'Please use Google OAuth to login' });
     }
@@ -724,7 +687,7 @@ app.get('/api/files/:id/download', authMiddleware, asyncHandler(async (req, res)
         return res.status(404).json({ success: false, error: 'File not found on server' });
     }
 
-    logger.info('⬇️ File download requested', { userId: req.user.id, fileId: id, filename: file.original_name });
+    logger.info('⬇️ File download requested', { userId: req.user.id, fileId: id });
     
     res.download(absolutePath, file.original_name, (err) => {
         if (err) {
@@ -739,7 +702,6 @@ app.get('/api/files/:id/download', authMiddleware, asyncHandler(async (req, res)
 
 // 404 handler
 app.use((req, res, next) => {
-    logger.warn('🔍 404 Not Found', { path: req.path, method: req.method });
     res.status(404).json({ success: false, error: 'Endpoint not found' });
 });
 
@@ -749,8 +711,7 @@ app.use((err, req, res, next) => {
         error: err.message,
         stack: err.stack,
         url: req.originalUrl,
-        method: req.method,
-        userAgent: req.get('User-Agent')
+        method: req.method
     });
     
     res.status(500).json({ 
@@ -766,27 +727,20 @@ let server;
 
 const startServer = async () => {
     try {
-        // Initialize database
         await initDatabase();
         
-        // Start HTTP server
         server = app.listen(PORT, '0.0.0.0', () => {
             logger.info(`🎉 Cloud Backup Server is running!`, {
                 port: PORT,
                 environment: NODE_ENV,
-                processId: process.pid,
-                nodeVersion: process.version,
-                platform: process.platform
-            });
-            
-            logger.info(`🔗 Server URLs:`, {
-                local: `http://localhost:${PORT}`,
-                health: `http://localhost:${PORT}/health`,
-                oauth: process.env.GOOGLE_CLIENT_ID ? `http://localhost:${PORT}/auth/google` : 'Not configured'
+                urls: {
+                    health: `http://localhost:${PORT}/health`,
+                    root: `http://localhost:${PORT}/`,
+                    oauth: process.env.GOOGLE_CLIENT_ID ? `http://localhost:${PORT}/auth/google` : 'Not configured'
+                }
             });
         });
 
-        // Handle server errors
         server.on('error', (err) => {
             logger.error('❌ Server error', { error: err.message, code: err.code });
             process.exit(1);
@@ -801,7 +755,6 @@ const startServer = async () => {
     }
 };
 
-// Graceful shutdown handler
 const gracefulShutdown = async (signal) => {
     logger.warn(`🛑 Received ${signal}. Starting graceful shutdown...`);
     
@@ -819,26 +772,21 @@ const gracefulShutdown = async (signal) => {
         });
     } else {
         await closeDatabaseConnection();
-        logger.info('👋 Shutdown completed (server was not running)');
         process.exit(0);
     }
     
-    // Force shutdown after timeout
     setTimeout(() => {
         logger.error('⏰ Forced shutdown due to timeout');
         process.exit(1);
     }, 30000);
 };
 
-// Process signal handlers
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
-// Unhandled rejection/exception handlers
 process.on('unhandledRejection', (reason, promise) => {
     logger.error('💥 Unhandled Promise Rejection', { 
-        reason: reason?.stack || reason,
-        promise: promise.toString()
+        reason: reason?.stack || reason
     });
     gracefulShutdown('unhandledRejection');
 });
