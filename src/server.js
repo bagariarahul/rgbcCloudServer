@@ -67,18 +67,19 @@ if (connStr && connStr.startsWith('postgresql://')) {
   const { Pool } = require('pg');
   pool = new Pool({
     connectionString: connStr,
-    ssl: { rejectUnauthorized: false }
+    ssl: sslOption
   });
 
-    try {
-    const client = await pool.connect();
+  pool.connect()
+  .then(client => {
     client.release();
-    console.log('✅ Postgres connection established (using connection string from env).');
-  } catch (err) {
+    console.log('✅ Postgres connection established (using connectionString from env).');
+  })
+  .catch(err => {
     console.error('❌ Postgres connection test failed:', err);
-    // don't silently continue — fail startup so we see it in logs
-    throw err;
-  }
+    // Exit so Railway shows a failing deployment and you can see the error in logs
+    process.exit(1);
+  });
 
  pool.connect()
     .then(client => {
