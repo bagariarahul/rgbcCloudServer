@@ -445,14 +445,7 @@ app.get('/download', async (req, res) => {
     try {
         const { file, user } = req.query;
         
-        if (!file) {
-            return res.status(400).json({
-                error: 'File parameter required',
-                message: 'Please specify a file to download'
-            });
-        }
-
-        console.log(`📥 Download requested: ${file} by ${user || 'anonymous'}`);
+        console.log(`📥 Download requested: ${file || 'latest'} by ${user || 'anonymous'}`);
         
         const uploadsDir = process.env.UPLOAD_PATH || './uploads';
         const uploadedFiles = await fs.readdir(uploadsDir);
@@ -463,35 +456,94 @@ app.get('/download', async (req, res) => {
                 message: 'No uploaded files available for download'
             });
         }
-        
-        // Get the most recent file
-        const fileStats = await Promise.all(
-            uploadedFiles.map(async filename => ({
-                name: filename,
-                path: `${uploadsDir}/${filename}`,
-                time: (await fs.stat(`${uploadsDir}/${filename}`)).mtime.getTime()
-            }))
-        );
-        
-        const latestFile = fileStats.sort((a, b) => b.time - a.time)[0];
 
-        console.log(`📂 Serving file: ${latestFile.name}`);
+        let targetFile;
+        let actualFilename;
+
+        if (file) {
+            // SPECIFIC FILE REQUESTED - find it
+            console.log(`🔍 Looking for specific file: ${file}`);
+            
+            // Check if exact filename exists
+            if (uploadedFiles.includes(file)) {
+                targetFile = file;
+                actualFilename = file;
+                console.log(`✅ Found exact match: ${file}`);
+            } else {
+                // Check if it's part of a generated filename (uuid-originalname format)
+                const foundFile = uploadedFiles.find(uploadedFile => {
+                    // Check if uploaded file ends with the requested file
+                    return uploadedFile.includes(file) || uploadedFile.endsWith(file);
+                });
+                
+                if (foundFile) {
+                    targetFile = foundFile;
+                    actualFilename = file; // Use requested name for download
+                    console.log(`✅ Found similar file: ${foundFile} for request: ${file}`);
+                } else {
+                    return res.status(404).json({
+                        error: 'File not found',
+                        message: `File "${file}" not found. Available files: ${uploadedFiles.join(', ')}`
+                    });
+                }
+            }
+        } else {
+            // NO SPECIFIC FILE - get latest
+            console.log(`📂 No specific file requested, getting latest...`);
+            
+            const fileStats = await Promise.all(
+                uploadedFiles.map(async filename => ({
+                    name: filename,
+                    path: `${uploadsDir}/${filename}`,
+                    time: (await fs.stat(`${uploadsDir}/${filename}`)).mtime.getTime()
+                }))
+            );
+            
+            const latestFile = fileStats.sort((a, b) => b.time - a.time)[0];
+            targetFile = latestFile.name;
+            actualFilename = latestFile.name;
+            console.log(`📂 Serving latest file: ${latestFile.name}`);
+        }
+
+        const filePath = `${uploadsDir}/${targetFile}`;
         
-        res.setHeader('Content-Disposition', `attachment; filename="${file}"`);
+        // Verify file exists
+        try {
+            await fs.access(filePath);
+        } catch (error) {
+            return res.status(404).json({
+                error: 'File not accessible',
+                message: `File ${targetFile} exists but cannot be accessed`
+            });
+        }
+        
+        console.log(`📤 Serving file: ${targetFile} as: ${actualFilename}`);
+        
+        res.setHeader('Content-Disposition', `attachment; filename="${actualFilename}"`);
         res.setHeader('Content-Type', 'application/octet-stream');
         
-        const fileStream = require('fs').createReadStream(latestFile.path);
+        const fileStream = require('fs').createReadStream(filePath);
+        
+        fileStream.on('error', (error) => {
+            console.error('❌ File stream error:', error);
+            if (!res.headersSent) {
+                res.status(500).json({
+                    error: 'File read error',
+                    message: 'Error reading the file'
+                });
+            }
+        });
+        
         fileStream.pipe(res);
 
     } catch (error) {
-        console.error('Download error:', error);
+        console.error('❌ Download error:', error);
         res.status(500).json({
             error: 'Download failed',
             message: 'An internal server error occurred'
         });
     }
 });
-
 // =============================================================================
 // 🚨 ERROR HANDLING
 // =============================================================================
