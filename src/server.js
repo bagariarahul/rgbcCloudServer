@@ -19,6 +19,7 @@ const Joi = require('joi');
 const passport = require('passport');
 const GoogleStrategy = require('passport-google-oauth20').Strategy;
 const session = require('express-session');
+const PGStore = require('connect-pg-simple')(session);
 
 // =============================================================================
 // 📝 LOGGER SETUP
@@ -60,6 +61,81 @@ logger.info('📋 Configuration loaded', {
 });
 
 // =============================================================================
+// 🚀 EXPRESS APP & MIDDLEWARE SETUP
+// =============================================================================
+const app = express();
+
+// Security middleware
+app.use(helmet({
+    contentSecurityPolicy: false, // Disable for development
+    crossOriginEmbedderPolicy: false
+}));
+app.use(compression());
+
+// CORS configuration - Allow all origins for now
+app.use(cors({
+    origin: true, // Allow all origins
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
+}));
+
+// Logging middleware
+app.use(morgan('combined', { 
+    stream: { 
+        write: message => logger.info(message.trim(), { type: 'access_log' }) 
+    },
+    skip: (req, res) => req.path === '/health'
+}));
+
+// Body parsing middleware
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+// Rate limiting
+const limiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: NODE_ENV === 'production' ? 200 : 1000,
+    message: { success: false, error: 'Too many requests, please try again later.' },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+app.use('/api', limiter); // Only apply to API routes
+
+// =============================================================================
+// 🔐 SESSION & PASSPORT SETUP - UPDATED FOR PRODUCTION
+// =============================================================================
+let sessionStore;
+
+if (DATABASE_URL && DATABASE_URL.startsWith('postgresql://')) {
+    sessionStore = new PGStore({
+        conString: DATABASE_URL,
+        createTableIfMissing: true
+    });
+    logger.info('✅ Using PostgreSQL session store');
+} else {
+    sessionStore = new session.MemoryStore();
+    logger.info('⚠️ Using memory session store (development only)');
+}
+
+app.use(session({
+    store: sessionStore,
+    secret: SESSION_SECRET,
+    resave: false,
+    saveUninitialized: false,
+    name: 'cloudbackup.sid',
+    cookie: {
+        secure: NODE_ENV === 'production',
+        httpOnly: true,
+        maxAge: 24 * 60 * 60 * 1000,
+        sameSite: 'lax'
+    }
+}));
+
+app.use(passport.initialize());
+app.use(passport.session());
+
+// =============================================================================
 // 🗄️ DATABASE SETUP & CONNECTION - RAILWAY OPTIMIZED
 // =============================================================================
 let pool;
@@ -81,7 +157,7 @@ if (DATABASE_URL && DATABASE_URL.startsWith('postgresql://')) {
         allowExitOnIdle: true
     };
 
-    // Only force SSL in production on Railway
+    // SSL configuration for Railway
     if (isProduction && isRailway) {
         poolConfig.ssl = {
             rejectUnauthorized: false
@@ -292,70 +368,8 @@ const initDatabase = async () => {
 };
 
 // =============================================================================
-// 🚀 EXPRESS APP & MIDDLEWARE SETUP
+// 🔐 PASSPORT SETUP
 // =============================================================================
-const app = express();
-
-// Security middleware
-app.use(helmet({
-    contentSecurityPolicy: false, // Disable for development
-    crossOriginEmbedderPolicy: false
-}));
-app.use(compression());
-
-// CORS configuration - Allow all origins for now
-app.use(cors({
-    origin: true, // Allow all origins
-    credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
-}));
-
-// Logging middleware
-app.use(morgan('combined', { 
-    stream: { 
-        write: message => logger.info(message.trim(), { type: 'access_log' }) 
-    },
-    skip: (req, res) => req.path === '/health'
-}));
-
-// Body parsing middleware
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
-
-// Rate limiting
-const limiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 minutes
-    max: NODE_ENV === 'production' ? 200 : 1000,
-    message: { success: false, error: 'Too many requests, please try again later.' },
-    standardHeaders: true,
-    legacyHeaders: false,
-});
-app.use('/api', limiter); // Only apply to API routes
-
-// =============================================================================
-// 🔐 SESSION & PASSPORT SETUP
-// =============================================================================
-// Use memory store for now to avoid session table issues
-const sessionStore = new session.MemoryStore();
-logger.info('⚠️ Using memory session store');
-
-app.use(session({
-    store: sessionStore,
-    secret: SESSION_SECRET,
-    resave: false,
-    saveUninitialized: false,
-    name: 'cloudbackup.sid',
-    cookie: {
-        secure: NODE_ENV === 'production', // Use secure cookies in production
-        httpOnly: true,
-        maxAge: 24 * 60 * 60 * 1000, // 24 hours
-        sameSite: 'lax'
-    }
-}));
-
-app.use(passport.initialize());
-app.use(passport.session());
 
 // Google OAuth Strategy
 if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
@@ -476,11 +490,17 @@ const asyncHandler = (fn) => (req, res, next) => {
 // 🌐 API ROUTES
 // =============================================================================
 
-// Health check with database connectivity test
+// Health check with proper database validation
 app.get('/health', asyncHandler(async (req, res) => {
     try {
-        // Test database connection
-        await dbGet('SELECT 1 as test');
+        // Set a timeout for the database query
+        const dbQuery = dbGet('SELECT 1 as test');
+        const timeout = new Promise((resolve, reject) => {
+            setTimeout(() => reject(new Error('Database timeout')), 5000);
+        });
+
+        await Promise.race([dbQuery, timeout]);
+
         res.status(200).json({ 
             status: 'healthy', 
             timestamp: new Date().toISOString(),
@@ -489,10 +509,10 @@ app.get('/health', asyncHandler(async (req, res) => {
             database: 'connected'
         });
     } catch (error) {
-        logger.error('❌ Health check failed - database connection error', { error: error.message });
+        logger.error('❌ Health check failed', { error: error.message });
         res.status(500).json({ 
             status: 'unhealthy', 
-            error: 'Database connection failed',
+            error: 'Health check failed: ' + error.message,
             timestamp: new Date().toISOString(),
             database: 'disconnected'
         });
@@ -520,6 +540,47 @@ app.get('/', (req, res) => {
         }
     });
 });
+
+// Metrics endpoint for monitoring
+app.get('/metrics', asyncHandler(async (req, res) => {
+    const dbStatus = await dbGet('SELECT 1 as status');
+    const fileCount = await dbGet('SELECT COUNT(*) as count FROM files');
+    const userCount = await dbGet('SELECT COUNT(*) as count FROM users');
+    
+    res.status(200).json({
+        status: 'ok',
+        metrics: {
+            database: dbStatus ? 'connected' : 'disconnected',
+            files: fileCount.count,
+            users: userCount.count,
+            uptime: process.uptime(),
+            memory: process.memoryUsage()
+        }
+    });
+}));
+
+// Status endpoint
+app.get('/status', asyncHandler(async (req, res) => {
+    try {
+        const dbStatus = await dbGet('SELECT 1 as status');
+        
+        res.status(200).json({
+            status: 'ok',
+            services: {
+                database: dbStatus ? 'connected' : 'disconnected',
+                storage: fs.existsSync(UPLOADS_DIR) ? 'available' : 'unavailable'
+            },
+            timestamp: new Date().toISOString(),
+            uptime: process.uptime()
+        });
+    } catch (error) {
+        res.status(500).json({
+            status: 'error',
+            error: 'Service unavailable',
+            timestamp: new Date().toISOString()
+        });
+    }
+}));
 
 // Google OAuth routes
 if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
@@ -787,27 +848,28 @@ const startServer = async () => {
 const gracefulShutdown = async (signal) => {
     logger.warn(`🛑 Received ${signal}. Starting graceful shutdown...`);
     
+    // Close HTTP server first
     if (server) {
         server.close(async (err) => {
             if (err) {
                 logger.error('❌ Error closing HTTP server', { error: err.message });
-            } else {
-                logger.info('✅ HTTP server closed');
             }
             
+            // Close database connection
             await closeDatabaseConnection();
             logger.info('👋 Graceful shutdown completed');
             process.exit(0);
         });
+        
+        // Force close after 30 seconds
+        setTimeout(() => {
+            logger.error('⏰ Forced shutdown due to timeout');
+            process.exit(1);
+        }, 30000);
     } else {
         await closeDatabaseConnection();
         process.exit(0);
     }
-    
-    setTimeout(() => {
-        logger.error('⏰ Forced shutdown due to timeout');
-        process.exit(1);
-    }, 30000);
 };
 
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
