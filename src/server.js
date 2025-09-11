@@ -65,6 +65,24 @@ const connStr = process.env.DATABASE_PUBLIC_URL || process.env.DATABASE_URL || '
 if (connStr && connStr.startsWith('postgresql://')) {
   isPostgres = true;
   const { Pool } = require('pg');
+  let sslOption = false;
+  try {
+    const lower = connStr.toLowerCase();
+    if (lower.includes('.proxy.rlwy.net') || lower.includes('tramway.proxy.rlwy.net') || lower.includes('proxy.rlwy.net')) {
+      // public proxy -> use TLS but allow Railway certs
+      sslOption = { rejectUnauthorized: false };
+    } else if (lower.includes('.railway.internal')) {
+      // internal host -> typically no TLS
+      sslOption = false;
+    } else {
+      // default to TLS but allow self-signed-like certs
+      sslOption = { rejectUnauthorized: false };
+    }
+  } catch (e) {
+    sslOption = { rejectUnauthorized: false };
+  }
+
+
   pool = new Pool({
     connectionString: connStr,
     ssl: sslOption
